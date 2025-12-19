@@ -1,0 +1,5 @@
+# This directory stores datasets that have been used for training
+# After training, datasets are moved here from Datasets/ using FIFO logic
+# This maintains a history of training data
+
+

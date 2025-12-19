@@ -1,0 +1,196 @@
+@import url("https://fonts.googleapis.com/css2?family=Work+Sans:wght@400;500;600;700&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Lora:wght@400;500;600;700&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Inconsolata:wght@400;700&display=swap");
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Definition of the design system. All colors, gradients, fonts, etc should be defined here. 
+All colors MUST be HSL.
+*/
+
+@layer base {
+  :root {
+    --background: 220 20% 8%;
+    --foreground: 210 20% 95%;
+
+    --card: 220 18% 12%;
+    --card-foreground: 210 20% 95%;
+
+    --popover: 220 18% 14%;
+    --popover-foreground: 210 20% 95%;
+
+    --primary: 158 64% 51%;
+    --primary-foreground: 220 20% 8%;
+
+    --secondary: 220 15% 18%;
+    --secondary-foreground: 210 20% 95%;
+
+    --muted: 220 15% 20%;
+    --muted-foreground: 215 15% 60%;
+
+    --accent: 158 64% 51%;
+    --accent-foreground: 220 20% 8%;
+
+    --destructive: 0 72% 55%;
+    --destructive-foreground: 210 20% 95%;
+
+    --success: 142 72% 45%;
+    --success-foreground: 220 20% 8%;
+
+    --warning: 38 92% 50%;
+    --warning-foreground: 220 20% 8%;
+
+    --border: 220 15% 22%;
+    --input: 220 15% 18%;
+    --ring: 158 64% 51%;
+
+    --radius: 0.5rem;
+
+    --chart-1: 158 64% 51%;
+    --chart-2: 0 72% 55%;
+    --chart-3: 38 92% 50%;
+    --chart-4: 200 80% 50%;
+    --chart-5: 280 65% 60%;
+
+    --ai-purple: 270 70% 60%;
+    --ai-purple-foreground: 210 20% 95%;
+
+    --font-sans: 'Work Sans', ui-sans-serif, system-ui, sans-serif;
+    --font-mono: 'Inconsolata', ui-monospace, monospace;
+  }
+
+  .dark {
+    --background: 220 20% 8%;
+    --foreground: 210 20% 95%;
+    --card: 220 18% 12%;
+    --card-foreground: 210 20% 95%;
+    --popover: 220 18% 14%;
+    --popover-foreground: 210 20% 95%;
+    --primary: 158 64% 51%;
+    --primary-foreground: 220 20% 8%;
+    --secondary: 220 15% 18%;
+    --secondary-foreground: 210 20% 95%;
+    --muted: 220 15% 20%;
+    --muted-foreground: 215 15% 60%;
+    --accent: 158 64% 51%;
+    --accent-foreground: 220 20% 8%;
+    --destructive: 0 72% 55%;
+    --destructive-foreground: 210 20% 95%;
+    --success: 142 72% 45%;
+    --success-foreground: 220 20% 8%;
+    --warning: 38 92% 50%;
+    --warning-foreground: 220 20% 8%;
+    --border: 220 15% 22%;
+    --input: 220 15% 18%;
+    --ring: 158 64% 51%;
+    --ai-purple: 270 70% 60%;
+    --ai-purple-foreground: 210 20% 95%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+}
+
+/* Animations */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slide-in-left {
+  from {
+    opacity: 0;
+    transform: translateX(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes glow-pulse {
+  0%, 100% {
+    box-shadow: 0 0 5px hsl(var(--primary) / 0.3);
+  }
+  50% {
+    box-shadow: 0 0 20px hsl(var(--primary) / 0.5);
+  }
+}
+
+@layer utilities {
+  .animate-fade-in {
+    animation: fade-in 0.4s ease-out forwards;
+  }
+
+  .animate-slide-in-left {
+    animation: slide-in-left 0.3s ease-out forwards;
+  }
+
+  /* Card hover effects */
+  .card-hover {
+    @apply transition-all duration-300 ease-out;
+  }
+
+  .card-hover:hover {
+    @apply shadow-lg;
+    box-shadow: 0 4px 20px hsl(var(--primary) / 0.1);
+    transform: translateY(-2px);
+  }
+
+  /* Button hover glow */
+  .btn-glow {
+    @apply transition-all duration-200;
+  }
+
+  .btn-glow:hover:not(:disabled) {
+    box-shadow: 0 0 15px hsl(var(--primary) / 0.4);
+  }
+
+  /* Button hover scale */
+  .btn-hover {
+    @apply transition-all duration-200;
+  }
+
+  .btn-hover:hover:not(:disabled) {
+    transform: translateY(-1px);
+  }
+
+  .btn-hover:active:not(:disabled) {
+    transform: translateY(0);
+  }
+
+  /* Table row hover */
+  .table-row-hover {
+    @apply transition-colors duration-150;
+  }
+
+  .table-row-hover:hover {
+    @apply bg-muted/50;
+  }
+
+  /* Gradient text */
+  .gradient-text {
+    @apply bg-clip-text text-transparent;
+    background-image: linear-gradient(135deg, hsl(var(--primary)), hsl(var(--chart-4)));
+  }
+
+  /* Glass effect */
+  .glass-effect {
+    @apply backdrop-blur-sm;
+    background: hsl(var(--card) / 0.8);
+  }
+}
