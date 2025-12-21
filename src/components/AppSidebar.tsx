@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { useLocation, Link } from 'react-router-dom';
 import {
   LayoutDashboard,
@@ -17,7 +18,6 @@ import {
   SidebarGroupLabel,
   SidebarHeader,
   SidebarMenu,
-  SidebarMenuButton,
   SidebarMenuItem,
   SidebarFooter,
   useSidebar,
@@ -43,48 +43,62 @@ const mlNavItems = [
 
 export function AppSidebar() {
   const location = useLocation();
-  const { state } = useSidebar();
+  const { state, isMobile, openMobile, setOpenMobile } = useSidebar();
   const isCollapsed = state === 'collapsed';
 
   const isActive = (path: string) => location.pathname === path;
 
+  useEffect(() => {
+    if (isMobile && openMobile) {
+      setOpenMobile(false);
+    }
+  }, [isMobile, openMobile, setOpenMobile, location.pathname]);
+
   const NavItem = ({ item }: { item: { path: string; label: string; icon: any } }) => (
     <SidebarMenuItem>
-      <SidebarMenuButton
-        asChild
-        isActive={isActive(item.path)}
-        tooltip={item.label}
-        className="transition-all duration-200 hover:translate-x-1"
+      <Link 
+        to={item.path}
+        onClick={() => {
+          if (isMobile) setOpenMobile(false);
+        }}
+        className={cn(
+          "flex w-full items-center gap-3 rounded-md p-2 text-sm transition-all duration-200",
+          "hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring",
+          isActive(item.path) && "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
+        )}
       >
-        <Link to={item.path} className="flex items-center gap-3">
-          <item.icon className={cn(
-            "h-4 w-4 shrink-0 transition-colors duration-200",
-            isActive(item.path) && "text-primary"
-          )} />
-          <span className={cn(
-            "transition-all duration-200",
-            isCollapsed && "opacity-0 w-0 overflow-hidden"
-          )}>
+        <item.icon className={cn(
+          "h-4 w-4 shrink-0 transition-colors duration-200",
+          isActive(item.path) && "text-primary"
+        )} />
+        {!isCollapsed && (
+          <span className="transition-opacity duration-200">
             {item.label}
           </span>
-        </Link>
-      </SidebarMenuButton>
+        )}
+      </Link>
     </SidebarMenuItem>
   );
 
   return (
     <Sidebar collapsible="icon">
       <SidebarHeader className="border-b border-border p-4">
-        <Link to="/" className="flex items-center gap-2 group">
+        <Link 
+          to="/" 
+          onClick={() => {
+            if (isMobile) setOpenMobile(false);
+          }}
+          className="flex items-center gap-2 group transition-all duration-200 hover:opacity-80"
+        >
           <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary transition-all duration-300 group-hover:shadow-lg group-hover:shadow-primary/30">
             <TrendingUp className="h-4 w-4 text-primary-foreground" />
           </div>
-          <span className={cn(
-            "font-bold text-lg text-foreground transition-all duration-200",
-            isCollapsed && "opacity-0 w-0 overflow-hidden"
-          )}>
-            TradeBot
-          </span>
+          {!isCollapsed && (
+            <span className="font-bold text-lg text-foreground transition-opacity duration-200">
+              TradeBot
+            </span>
+          )}
         </Link>
       </SidebarHeader>
 
@@ -133,12 +147,11 @@ export function AppSidebar() {
       </SidebarContent>
 
       <SidebarFooter className="border-t border-border p-4">
-        <div className={cn(
-          "text-xs text-muted-foreground transition-opacity duration-200",
-          isCollapsed && "opacity-0"
-        )}>
-          Press <kbd className="px-1 py-0.5 bg-muted rounded text-xs">⌘B</kbd> to toggle
-        </div>
+        {!isCollapsed && (
+          <div className="text-xs text-muted-foreground">
+            Press <kbd className="px-1 py-0.5 bg-muted rounded text-xs">⌘B</kbd> to toggle
+          </div>
+        )}
       </SidebarFooter>
     </Sidebar>
   );

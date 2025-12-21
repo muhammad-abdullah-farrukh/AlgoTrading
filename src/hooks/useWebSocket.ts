@@ -68,7 +68,18 @@ export const useWebSocket = (config: WebSocketConfig) => {
   const reconnectCountRef = useRef(0);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
   const shouldReconnectRef = useRef(true);
+  const onMessageRef = useRef<WebSocketConfig['onMessage']>(onMessage);
+  const onOpenRef = useRef<WebSocketConfig['onOpen']>(onOpen);
+  const onCloseRef = useRef<WebSocketConfig['onClose']>(onClose);
+  const onErrorRef = useRef<WebSocketConfig['onError']>(onError);
   const fullURL = getWebSocketURL(url);
+
+  useEffect(() => {
+    onMessageRef.current = onMessage;
+    onOpenRef.current = onOpen;
+    onCloseRef.current = onClose;
+    onErrorRef.current = onError;
+  }, [onMessage, onOpen, onClose, onError]);
 
   const connect = useCallback(() => {
     // Don't connect if already connected or connecting
@@ -100,19 +111,19 @@ export const useWebSocket = (config: WebSocketConfig) => {
           isConnecting: false,
           error: null,
         }));
-        onOpen?.();
+        onOpenRef.current?.();
       };
 
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
           setState((prev) => ({ ...prev, lastMessage: data }));
-          onMessage?.(data);
+          onMessageRef.current?.(data);
         } catch (error) {
           console.error('[WebSocket] Failed to parse message:', error);
           // Still call onMessage with raw data
           setState((prev) => ({ ...prev, lastMessage: event.data }));
-          onMessage?.(event.data);
+          onMessageRef.current?.(event.data);
         }
       };
 
@@ -124,7 +135,7 @@ export const useWebSocket = (config: WebSocketConfig) => {
           error: errorMessage,
           isConnecting: false,
         }));
-        onError?.(error);
+        onErrorRef.current?.(error);
       };
 
       ws.onclose = (event) => {
@@ -155,7 +166,7 @@ export const useWebSocket = (config: WebSocketConfig) => {
           }));
         }
 
-        onClose?.();
+        onCloseRef.current?.();
       };
 
       wsRef.current = ws;
@@ -166,9 +177,9 @@ export const useWebSocket = (config: WebSocketConfig) => {
         isConnecting: false,
         error: 'Failed to create WebSocket connection',
       }));
-      onError?.(error as Event);
+      onErrorRef.current?.(error as Event);
     }
-  }, [fullURL, onMessage, onOpen, onClose, onError, reconnectAttempts, reconnectInterval]);
+  }, [fullURL, reconnectAttempts, reconnectInterval]);
 
   const disconnect = useCallback(() => {
     shouldReconnectRef.current = false;
@@ -190,9 +201,9 @@ export const useWebSocket = (config: WebSocketConfig) => {
       error: null,
     });
 
-    onClose?.();
+    onCloseRef.current?.();
     console.log('[WebSocket] Disconnected');
-  }, [onClose]);
+  }, []);
 
   const sendMessage = useCallback(
     (message: unknown) => {
@@ -228,41 +239,4 @@ export const useWebSocket = (config: WebSocketConfig) => {
     disconnect,
     sendMessage,
   };
-};
-
-/**
- * Mock WebSocket for simulating real-time price updates.
- * Kept for backward compatibility with existing code.
- */
-export const useMockPriceStream = (symbol: string, basePrice: number = 1.0850) => {
-  const [price, setPrice] = useState(basePrice);
-  const [isStreaming, setIsStreaming] = useState(false);
-  const intervalRef = useRef<NodeJS.Timeout>();
-
-  const startStream = useCallback(() => {
-    setIsStreaming(true);
-    intervalRef.current = setInterval(() => {
-      setPrice((prev) => {
-        const change = (Math.random() - 0.5) * 0.0005;
-        return Number((prev + change).toFixed(5));
-      });
-    }, 1000);
-  }, []);
-
-  const stopStream = useCallback(() => {
-    setIsStreaming(false);
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-    }
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-      }
-    };
-  }, []);
-
-  return { price, isStreaming, startStream, stopStream };
 };

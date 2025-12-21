@@ -11,7 +11,8 @@ except ImportError:
         "Or install all dependencies: pip install -r requirements.txt"
     )
 
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
 from app.config import settings
 # Note: Base is imported inside connect() method to avoid scoping issues with nested functions
 from app.utils.logging import get_logger
@@ -58,11 +59,20 @@ class Database:
                     raise
                 
                 # Create session factory
-                self._session_factory = async_sessionmaker(
-                    self._engine,
-                    class_=AsyncSession,
-                    expire_on_commit=False
-                )
+                try:
+                    from sqlalchemy.ext.asyncio import async_sessionmaker  # type: ignore
+
+                    self._session_factory = async_sessionmaker(
+                        self._engine,
+                        class_=AsyncSession,
+                        expire_on_commit=False
+                    )
+                except Exception:
+                    self._session_factory = sessionmaker(
+                        bind=self._engine,
+                        class_=AsyncSession,
+                        expire_on_commit=False
+                    )
                 logger.info("Session factory created successfully")
                 
                 # Initialize database tables
@@ -91,12 +101,12 @@ class Database:
                     logger.info(f"Total tables created: {len(table_names)}")
                     
                     # Verify critical tables exist
-                    critical_tables = ['trades', 'positions', 'autotrading_settings', 'strategies', 'mt5_connection_status', 'ohlcv', 'dataset_metadata']
+                    critical_tables = ['trades', 'positions', 'autotrading_settings', 'strategies', 'mt5_connection_status', 'trading_settings', 'ohlcv', 'dataset_metadata']
                     missing_tables = [t for t in critical_tables if t not in table_names]
                     if missing_tables:
                         logger.warning(f"Missing critical tables: {', '.join(missing_tables)}")
                     else:
-                        logger.info("✓ All critical tables verified: trades, positions, autotrading_settings, strategies, mt5_connection_status, ohlcv, dataset_metadata")
+                        logger.info("✓ All critical tables verified: trades, positions, autotrading_settings, strategies, mt5_connection_status, trading_settings, ohlcv, dataset_metadata")
                         
                 except Exception as e:
                     logger.error(f"Failed to initialize database tables: {str(e)}")
@@ -123,8 +133,11 @@ class Database:
             async with self._engine.begin() as conn:
                 # Check and add missing columns to autotrading_settings
                 migration_result = await conn.run_sync(self._migrate_autotrading_settings)
-                if migration_result:
-                    logger.info(f"✓ Schema migration completed: {migration_result}")
+                migration_result_ohlcv = await conn.run_sync(self._migrate_ohlcv)
+
+                migration_results = [r for r in [migration_result, migration_result_ohlcv] if r]
+                if migration_results:
+                    logger.info(f"✓ Schema migration completed: {'; '.join(migration_results)}")
                 else:
                     logger.debug("Schema migration: no changes needed")
         except Exception as e:
@@ -156,7 +169,8 @@ class Database:
             
             # Define required columns to add (matching SQLAlchemy model)
             required_columns = {
-                'selected_strategy_id': 'INTEGER'  # SQLite doesn't support FK in ALTER TABLE, but model has FK constraint
+                'selected_strategy_id': 'INTEGER',  # SQLite doesn't support FK in ALTER TABLE, but model has FK constraint
+                'timeframe': 'VARCHAR(20)'
             }
             
             # Track what was added
@@ -193,9 +207,45 @@ class Database:
             # Log error but return None - don't fail startup
             # Migration errors should be investigated but shouldn't block application startup
             return None
+
+    @staticmethod
+    def _migrate_ohlcv(conn):
+        """Migrate ohlcv table to add missing columns safely."""
+        from sqlalchemy import text, inspect
+
+        try:
+            inspector = inspect(conn)
+            table_names = inspector.get_table_names()
+            if 'ohlcv' not in table_names:
+                return None
+
+            existing_columns = {col['name'] for col in inspector.get_columns('ohlcv')}
+            logger.debug(f"Existing columns in ohlcv: {sorted(existing_columns)}")
+
+            added_columns = []
+
+            if 'source' not in existing_columns:
+                try:
+                    conn.execute(text("ALTER TABLE ohlcv ADD COLUMN source VARCHAR(100)"))
+                    added_columns.append('source')
+                    logger.info("✓ Added column 'source' (VARCHAR(100)) to ohlcv table")
+                except Exception as e:
+                    error_msg = str(e)
+                    if 'duplicate column' in error_msg.lower() or 'already exists' in error_msg.lower():
+                        logger.debug("Column 'source' already exists, skipping")
+                    else:
+                        logger.error(f"Failed to add column 'source' to ohlcv: {error_msg}")
+
+            if added_columns:
+                return f"ohlcv: added columns: {', '.join(added_columns)}"
+            return None
+
+        except Exception as e:
+            logger.error(f"OHLCV schema migration check failed: {str(e)}")
+            return None
     
     async def disconnect(self) -> None:
-        """Close database connection."""
+        """Close database connection and cleanup all sessions."""
         if self._connected:
             try:
                 logger.info("Disconnecting from database...")

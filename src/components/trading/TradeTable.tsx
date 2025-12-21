@@ -10,7 +10,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Trade } from '@/utils/dummyData';
+import { type Trade } from '@/contexts/TradesContext';
 import { ArrowUpDown, ChevronLeft, ChevronRight } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -64,7 +64,9 @@ export const TradeTable = ({ trades, pageSize = 10 }: TradeTableProps) => {
   );
 
   const totalPnL = trades.reduce((sum, t) => sum + t.profitLoss, 0);
-  const winRate = (trades.filter(t => t.profitLoss > 0).length / trades.length) * 100;
+  const winRate = trades.length > 0
+    ? (trades.filter(t => t.profitLoss > 0).length / trades.length) * 100
+    : 0;
 
   const SortHeader = ({ field, children }: { field: SortField; children: React.ReactNode }) => (
     <Button

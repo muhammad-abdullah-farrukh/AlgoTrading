@@ -167,7 +167,8 @@ class PaperTradingService:
         trade_type: str,
         quantity: float,
         price: Optional[float] = None,
-        skip_controls: bool = False
+        skip_controls: bool = False,
+        external_order_id: Optional[str] = None
     ) -> Tuple[Optional[Dict], Optional[str]]:
         """
         Open a new position (buy or sell) - PAPER TRADING ONLY.
@@ -276,26 +277,6 @@ class PaperTradingService:
             # For sell positions, quantity is negative
             position_quantity = quantity if trade_type == 'buy' else -quantity
             
-            # Execute real MT5 trade if enabled and MT5 is connected
-            mt5_trade_result = None
-            try:
-                mt5_client = get_mt5_client()
-                from app.config import settings
-                
-                # Check if real trading is enabled (allow if mt5_real_trading is True OR PAPER_TRADING_ONLY is False)
-                if mt5_client.is_connected and settings.mt5_real_trading:
-                    mt5_trade_result = await self._execute_mt5_trade(
-                        mt5_client, symbol, trade_type, quantity, price
-                    )
-                    if mt5_trade_result and mt5_trade_result.get('error'):
-                        logger.warning(f"[Trading] MT5 trade failed: {mt5_trade_result['error']}")
-                        # Continue with paper trade as fallback
-                    elif mt5_trade_result and mt5_trade_result.get('success'):
-                        logger.info(f"[Trading] Real MT5 trade executed: {trade_type} {quantity} {symbol}")
-                        # Still create paper trade record for tracking
-            except Exception as e:
-                logger.debug(f"[Trading] MT5 trade execution skipped: {str(e)}")
-            
             async for session in db.get_session():
                 # Optimized: Combine duplicate check and position lookup
                 from datetime import timedelta
@@ -358,7 +339,7 @@ class PaperTradingService:
                         quantity=quantity,
                         price=price,
                         timestamp=datetime.utcnow(),
-                        order_id=str(uuid.uuid4()),
+                        order_id=str(external_order_id) if external_order_id else str(uuid.uuid4()),
                         status='executed'
                     )
                     session.add(trade)
@@ -409,7 +390,7 @@ class PaperTradingService:
                         quantity=quantity,
                         price=price,
                         timestamp=datetime.utcnow(),
-                        order_id=str(uuid.uuid4()),
+                        order_id=str(external_order_id) if external_order_id else str(uuid.uuid4()),
                         status='executed'
                     )
                     session.add(trade)

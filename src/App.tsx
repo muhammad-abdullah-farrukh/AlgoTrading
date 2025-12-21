@@ -6,6 +6,8 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { SidebarProvider, SidebarTrigger, SidebarInset } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/AppSidebar";
 import { TradesProvider } from "@/contexts/TradesContext";
+import { TradingModeProvider } from "@/contexts/TradingModeContext";
+import { useAutotradingNotifications } from "@/hooks/useAutotradingNotifications";
 import Dashboard from "./pages/Dashboard";
 import MT5Connection from "./pages/MT5Connection";
 import TradeHistory from "./pages/TradeHistory";
@@ -18,41 +20,51 @@ import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
 
+const AppLayout = () => {
+  useAutotradingNotifications();
+  
+  return (
+    <div className="dark">
+      <Toaster />
+      <Sonner />
+      <SidebarProvider defaultOpen={true}>
+        <div className="min-h-screen flex w-full bg-background">
+          <AppSidebar />
+          <SidebarInset className="flex-1">
+            <header className="flex h-14 items-center gap-4 border-b border-border px-4">
+              <SidebarTrigger className="-ml-1" />
+              <div className="flex-1" />
+            </header>
+            <main className="flex-1 p-6">
+              <Routes>
+                <Route path="/" element={<Dashboard />} />
+                <Route path="/connection" element={<MT5Connection />} />
+                <Route path="/history" element={<TradeHistory />} />
+                <Route path="/trading" element={<Trading />} />
+                <Route path="/strategies" element={<Strategies />} />
+                <Route path="/autotrading" element={<Autotrading />} />
+                <Route path="/models" element={<ModelDashboard />} />
+                <Route path="/scraper" element={<WebScraper />} />
+                <Route path="*" element={<NotFound />} />
+              </Routes>
+            </main>
+          </SidebarInset>
+        </div>
+      </SidebarProvider>
+    </div>
+  );
+};
+
 const App = () => (
   <QueryClientProvider client={queryClient}>
     <TooltipProvider>
-      <TradesProvider>
-        <div className="dark">
-          <Toaster />
-          <Sonner />
-          <BrowserRouter>
-            <SidebarProvider defaultOpen={true}>
-              <div className="min-h-screen flex w-full bg-background">
-                <AppSidebar />
-                <SidebarInset className="flex-1">
-                  <header className="flex h-14 items-center gap-4 border-b border-border px-4">
-                    <SidebarTrigger className="-ml-1" />
-                    <div className="flex-1" />
-                  </header>
-                  <main className="flex-1 p-6">
-                    <Routes>
-                      <Route path="/" element={<Dashboard />} />
-                      <Route path="/connection" element={<MT5Connection />} />
-                      <Route path="/history" element={<TradeHistory />} />
-                      <Route path="/trading" element={<Trading />} />
-                      <Route path="/strategies" element={<Strategies />} />
-                      <Route path="/autotrading" element={<Autotrading />} />
-                      <Route path="/models" element={<ModelDashboard />} />
-                      <Route path="/scraper" element={<WebScraper />} />
-                      <Route path="*" element={<NotFound />} />
-                    </Routes>
-                  </main>
-                </SidebarInset>
-              </div>
-            </SidebarProvider>
-          </BrowserRouter>
-        </div>
-      </TradesProvider>
+      <BrowserRouter>
+        <TradingModeProvider>
+          <TradesProvider>
+            <AppLayout />
+          </TradesProvider>
+        </TradingModeProvider>
+      </BrowserRouter>
     </TooltipProvider>
   </QueryClientProvider>
 );

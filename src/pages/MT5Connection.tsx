@@ -10,24 +10,30 @@ import { Link, Server, Shield, Key, AlertCircle, CheckCircle } from 'lucide-reac
 import { toast } from '@/hooks/use-toast';
 
 const MT5Connection = () => {
-  const [credentials, setCredentials] = useState({
-    server: '',
-    login: '',
-    password: '',
-    apiKey: ''
-  });
-  
   const [mt5Status, setMt5Status] = useState<{
     connected: boolean;
     mode: 'real' | 'mock' | 'unavailable';
+    terminal_installed?: boolean;
+    logged_in?: boolean;
+    trading_enabled?: boolean;
+    account?: {
+      login?: number;
+      server?: string;
+      company?: string;
+      balance?: number;
+      equity?: number;
+      free_margin?: number;
+      trade_allowed?: boolean;
+      trade_expert?: boolean;
+    };
     error?: string;
   } | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Check MT5 status on mount and periodically
   useEffect(() => {
     const checkStatus = async () => {
+      setIsLoading(true);
       try {
         const status = await api.get<{
           status: string;
@@ -35,74 +41,92 @@ const MT5Connection = () => {
             mt5?: {
               connected: boolean;
               mode: 'real' | 'mock' | 'unavailable';
+              terminal_installed?: boolean;
+              logged_in?: boolean;
+              trading_enabled?: boolean;
+              account?: {
+                login?: number;
+                server?: string;
+                company?: string;
+                balance?: number;
+                equity?: number;
+                free_margin?: number;
+                trade_allowed?: boolean;
+                trade_expert?: boolean;
+              };
               error?: string;
             };
           };
         }>('/status');
-        
+
         if (status.components?.mt5) {
           setMt5Status({
             connected: status.components.mt5.connected,
             mode: status.components.mt5.mode,
+            terminal_installed: status.components.mt5.terminal_installed,
+            logged_in: status.components.mt5.logged_in,
+            trading_enabled: status.components.mt5.trading_enabled,
+            account: status.components.mt5.account,
             error: status.components.mt5.error,
           });
           setError(null);
+        } else {
+          setMt5Status(null);
         }
       } catch (err) {
         console.error('Failed to check MT5 status:', err);
         setError('Failed to check connection status');
+      } finally {
+        setIsLoading(false);
       }
     };
 
     checkStatus();
-    const interval = setInterval(checkStatus, 5000); // Check every 5 seconds
-
-    return () => clearInterval(interval);
   }, []);
 
-  const handleConnect = async () => {
-    if (!credentials.server || !credentials.login || !credentials.password) {
-      toast({
-        title: "Missing Credentials",
-        description: "Please fill in all required fields.",
-        variant: "destructive"
-      });
-      return;
-    }
-
+  const handleRefresh = async () => {
     setIsLoading(true);
     setError(null);
 
     try {
-      // Note: Backend MT5 connection is handled server-side via environment variables
-      // This form is for display purposes. Real connection happens on backend startup.
-      toast({
-        title: "MT5 Configuration",
-        description: "MT5 connection is managed server-side. Check backend logs for connection status.",
-      });
-      
-      // Refresh status after a moment
-      setTimeout(async () => {
-        try {
-          const status = await api.get<{
-            components: {
-              mt5?: {
-                connected: boolean;
-                mode: 'real' | 'mock' | 'unavailable';
-              };
+      const status = await api.get<{
+        status: string;
+        components: {
+          mt5?: {
+            connected: boolean;
+            mode: 'real' | 'mock' | 'unavailable';
+            terminal_installed?: boolean;
+            logged_in?: boolean;
+            trading_enabled?: boolean;
+            account?: {
+              login?: number;
+              server?: string;
+              company?: string;
+              balance?: number;
+              equity?: number;
+              free_margin?: number;
+              trade_allowed?: boolean;
+              trade_expert?: boolean;
             };
-          }>('/status');
-          if (status.components?.mt5) {
-            setMt5Status({
-              connected: status.components.mt5.connected,
-              mode: status.components.mt5.mode,
-            });
-          }
-        } catch (err) {
-          console.error('Failed to refresh status:', err);
-        }
-        setIsLoading(false);
-      }, 1000);
+            error?: string;
+          };
+        };
+      }>('/status');
+
+      if (status.components?.mt5) {
+        setMt5Status({
+          connected: status.components.mt5.connected,
+          mode: status.components.mt5.mode,
+          terminal_installed: status.components.mt5.terminal_installed,
+          logged_in: status.components.mt5.logged_in,
+          trading_enabled: status.components.mt5.trading_enabled,
+          account: status.components.mt5.account,
+          error: status.components.mt5.error,
+        });
+        setError(null);
+      } else {
+        setMt5Status(null);
+      }
     } catch (err) {
       setIsLoading(false);
       setError('Failed to check connection status');
@@ -111,6 +135,8 @@ const MT5Connection = () => {
         description: "Failed to check MT5 connection status.",
         variant: "destructive"
       });
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -150,9 +176,8 @@ const MT5Connection = () => {
                 <Input
                   id="server"
                   placeholder="e.g., broker-server.com:443"
-                  value={credentials.server}
-                  onChange={(e) => setCredentials(prev => ({ ...prev, server: e.target.value }))}
                   className="pl-10"
+                  disabled
                 />
               </div>
             </div>
@@ -164,9 +189,8 @@ const MT5Connection = () => {
                 <Input
                   id="login"
                   placeholder="Your MT5 account number"
-                  value={credentials.login}
-                  onChange={(e) => setCredentials(prev => ({ ...prev, login: e.target.value }))}
                   className="pl-10"
+                  disabled
                 />
               </div>
             </div>
@@ -179,9 +203,8 @@ const MT5Connection = () => {
                   id="password"
                   type="password"
                   placeholder="Your MT5 password"
-                  value={credentials.password}
-                  onChange={(e) => setCredentials(prev => ({ ...prev, password: e.target.value }))}
                   className="pl-10"
+                  disabled
                 />
               </div>
             </div>
@@ -194,21 +217,20 @@ const MT5Connection = () => {
                   id="apiKey"
                   type="password"
                   placeholder="Optional API key for extended features"
-                  value={credentials.apiKey}
-                  onChange={(e) => setCredentials(prev => ({ ...prev, apiKey: e.target.value }))}
                   className="pl-10"
+                  disabled
                 />
               </div>
             </div>
 
             <div className="flex gap-3 pt-4">
               <Button 
-                onClick={handleConnect} 
+                onClick={handleRefresh} 
                 disabled={isLoading}
                 className="flex-1"
               >
                 <Link className="h-4 w-4 mr-2" />
-                {isLoading ? 'Checking...' : 'Check Status'}
+                {isLoading ? 'Refreshing...' : 'Refresh Status'}
               </Button>
             </div>
           </CardContent>
@@ -244,6 +266,30 @@ const MT5Connection = () => {
                       {mt5Status.mode === 'real' ? 'Real MT5' : mt5Status.mode === 'mock' ? 'Mock' : 'Unavailable'}
                     </Badge>
                   </div>
+
+                  <div className="flex items-center justify-between p-3 rounded-lg bg-muted/50">
+                    <span className="text-sm text-muted-foreground">Terminal Installed</span>
+                    <Badge variant="outline">{mt5Status.terminal_installed ? 'Yes' : 'No'}</Badge>
+                  </div>
+
+                  <div className="flex items-center justify-between p-3 rounded-lg bg-muted/50">
+                    <span className="text-sm text-muted-foreground">Logged In</span>
+                    <Badge variant="outline">{mt5Status.logged_in ? 'Yes' : 'No'}</Badge>
+                  </div>
+
+                  <div className="flex items-center justify-between p-3 rounded-lg bg-muted/50">
+                    <span className="text-sm text-muted-foreground">Trading Enabled</span>
+                    <Badge variant="outline">{mt5Status.trading_enabled ? 'Yes' : 'No'}</Badge>
+                  </div>
+
+                  {mt5Status.account?.login && (
+                    <div className="flex items-center justify-between p-3 rounded-lg bg-muted/50">
+                      <span className="text-sm text-muted-foreground">Account</span>
+                      <span className="text-sm font-medium text-foreground">
+                        {mt5Status.account.login} • {mt5Status.account.server || '—'}
+                      </span>
+                    </div>
+                  )}
                   
                   {mt5Status.connected && (
                     <div className="flex items-start gap-3 p-4 rounded-lg bg-success/10 border border-success/20">

@@ -1,10 +1,20 @@
-import { Strategy } from '@/utils/dummyData';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import { Badge } from '@/components/ui/badge';
 import { Edit, Trash2, TrendingUp, TrendingDown, Cpu, Settings, Sparkles } from 'lucide-react';
 import { cn } from '@/lib/utils';
+
+export type Strategy = {
+  id: number;
+  name: string;
+  description?: string | null;
+  strategy_type: 'technical' | 'ai' | 'custom' | string;
+  enabled: boolean;
+  parameters?: string | null;
+  performance: number;
+  trades_count: number;
+};
 
 interface StrategyCardProps {
   strategy: Strategy;
@@ -26,7 +36,7 @@ const typeLabels = {
 };
 
 export const StrategyCard = ({ strategy, onToggle, onEdit, onDelete }: StrategyCardProps) => {
-  const TypeIcon = typeIcons[strategy.type];
+  const TypeIcon = typeIcons[(strategy.strategy_type as keyof typeof typeIcons) ?? 'custom'] ?? Cpu;
   
   return (
     <Card className={cn(
@@ -40,7 +50,7 @@ export const StrategyCard = ({ strategy, onToggle, onEdit, onDelete }: StrategyC
               <CardTitle className="text-lg truncate">{strategy.name}</CardTitle>
               <Badge variant="secondary" className="flex items-center gap-1">
                 <TypeIcon className="h-3 w-3" />
-                {typeLabels[strategy.type]}
+                {typeLabels[(strategy.strategy_type as keyof typeof typeLabels) ?? 'custom'] ?? String(strategy.strategy_type)}
               </Badge>
             </div>
             <p className="text-sm text-muted-foreground line-clamp-2">
@@ -49,7 +59,7 @@ export const StrategyCard = ({ strategy, onToggle, onEdit, onDelete }: StrategyC
           </div>
           <Switch
             checked={strategy.enabled}
-            onCheckedChange={(checked) => onToggle(strategy.id, checked)}
+            onCheckedChange={(checked) => onToggle(String(strategy.id), checked)}
           />
         </div>
       </CardHeader>
@@ -74,7 +84,7 @@ export const StrategyCard = ({ strategy, onToggle, onEdit, onDelete }: StrategyC
           <div className="bg-muted/50 rounded-lg p-3">
             <div className="text-xs text-muted-foreground mb-1">Total Trades</div>
             <div className="text-lg font-semibold text-foreground">
-              {strategy.trades}
+              {strategy.trades_count}
             </div>
           </div>
         </div>
@@ -83,9 +93,19 @@ export const StrategyCard = ({ strategy, onToggle, onEdit, onDelete }: StrategyC
         <div className="mb-4">
           <div className="text-xs text-muted-foreground mb-2">Parameters</div>
           <div className="flex flex-wrap gap-2">
-            {Object.entries(strategy.parameters).map(([key, value]) => (
+            {Object.entries((() => {
+              if (!strategy.parameters) return {};
+              if (typeof strategy.parameters === 'string') {
+                try {
+                  return JSON.parse(strategy.parameters) as Record<string, unknown>;
+                } catch {
+                  return {};
+                }
+              }
+              return {};
+            })()).map(([key, value]) => (
               <Badge key={key} variant="outline" className="text-xs">
-                {key}: {value}
+                {key}: {String(value)}
               </Badge>
             ))}
           </div>
@@ -97,7 +117,7 @@ export const StrategyCard = ({ strategy, onToggle, onEdit, onDelete }: StrategyC
             variant="outline"
             size="sm"
             className="flex-1"
-            onClick={() => onEdit(strategy.id)}
+            onClick={() => onEdit(String(strategy.id))}
           >
             <Edit className="h-4 w-4 mr-1" />
             Edit
@@ -106,7 +126,7 @@ export const StrategyCard = ({ strategy, onToggle, onEdit, onDelete }: StrategyC
             variant="outline"
             size="sm"
             className="text-destructive hover:text-destructive"
-            onClick={() => onDelete(strategy.id)}
+            onClick={() => onDelete(String(strategy.id))}
           >
             <Trash2 className="h-4 w-4" />
           </Button>

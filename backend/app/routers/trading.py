@@ -1,14 +1,18 @@
 """Paper trading endpoints."""
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
-from typing import Optional
+from typing import Optional, Tuple
 from pydantic import BaseModel, Field
 from app.services.paper_trading import paper_trading_service
+from app.services.live_trade_logger import live_trade_logger, LiveTradeEvent
 from app.utils.logging import get_logger
 import csv
 import json
 import io
 from datetime import datetime
+from app.database import db
+from app.models import TradingSettings
+from sqlalchemy import select
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/trade", tags=["trading"])
@@ -33,10 +37,76 @@ class CloseRequest(BaseModel):
     quantity: Optional[float] = Field(None, gt=0, description="Quantity to close (closes full position if not provided)")
 
 
+class TradingModeResponse(BaseModel):
+    live_mode: bool
+    updated_at: Optional[str] = None
+
+
+class TradingModeRequest(BaseModel):
+    live_mode: bool = Field(..., description="True for live mode, False for demo/paper mode")
+
+
+def _is_demo_server_name(server: Optional[str]) -> bool:
+    if not server:
+        return False
+    return "demo" in server.lower()
+
+
+def _is_demo_account(account_info: dict) -> bool:
+    try:
+        trade_mode = account_info.get('trade_mode')
+        if isinstance(trade_mode, int) and trade_mode == 0:
+            return True
+    except Exception:
+        pass
+    return _is_demo_server_name(account_info.get('server'))
+
+
+def _mt5_can_execute_live_orders(mt5_client, server_settings) -> Tuple[bool, Optional[str]]:
+    try:
+        status = mt5_client.get_detailed_status() if hasattr(mt5_client, "get_detailed_status") else {}
+        account_info = (status or {}).get('account_info') or {}
+
+        trading_enabled = bool((status or {}).get('trading_enabled'))
+        if not trading_enabled:
+            server_name = account_info.get('server')
+            login = account_info.get('login')
+            return False, (
+                "MT5 trading is not enabled for this account/session. "
+                f"(trade_allowed=false, login={login}, server={server_name})"
+            )
+
+        server_name = account_info.get('server')
+        is_demo = _is_demo_account(account_info)
+
+        if bool(server_settings.mt5_real_trading):
+            return True, None
+
+        if is_demo:
+            return True, None
+
+        return False, "MT5 real trading is disabled by server configuration (set MT5_REAL_TRADING=true)."
+    except Exception:
+        return False, "Failed to validate MT5 account status."
+
+
+async def _get_or_create_trading_settings() -> TradingSettings:
+    async for session in db.get_session():
+        result = await session.execute(select(TradingSettings).limit(1))
+        settings = result.scalar_one_or_none()
+        if settings is None:
+            settings = TradingSettings(live_mode=False)
+            session.add(settings)
+            await session.commit()
+            await session.refresh(settings)
+        return settings
+
+
+
 @router.post("/buy")
 async def buy_order(request: BuyRequest):
     """
-    Place a buy order (paper trading).
+    Place a buy order (supports both live MT5 and paper trading).
     
     Opens a long position or adds to existing position.
     Creates a trade record and updates position tracking.
@@ -45,25 +115,111 @@ async def buy_order(request: BuyRequest):
     try:
         logger.info(f"[API] Buy order request: {request.quantity} {request.symbol}")
         
-        position, error = await paper_trading_service.open_position(
-            request.symbol,
-            'buy',
-            request.quantity,
-            request.price,
-            skip_controls=True  # Manual trades skip controls
-        )
+        # Backend-authoritative trading mode
+        trading_settings = await _get_or_create_trading_settings()
+        live_mode_requested = bool(trading_settings.live_mode)
+
+        # Check if MT5 is connected for live trading
+        from app.services import get_mt5_client
+        from app.services.mock_mt5 import MockMT5Client
+        from app.config import settings
         
-        if error:
-            logger.warning(f"[API] Buy order rejected: {error}")
-            raise HTTPException(status_code=400, detail=error)
-        
-        logger.info(f"[API] Buy order executed successfully: {request.quantity} {request.symbol}")
-        
-        return {
-            "status": "success",
-            "message": f"Buy order executed for {request.quantity} {request.symbol}",
-            "position": position
-        }
+        mt5_client = get_mt5_client()
+        mt5_real_connected = mt5_client.is_connected and not isinstance(mt5_client, MockMT5Client)
+
+        can_execute_live, live_block_reason = (False, None)
+        if live_mode_requested and mt5_real_connected:
+            can_execute_live, live_block_reason = _mt5_can_execute_live_orders(mt5_client, settings)
+
+        is_live_mode = live_mode_requested and mt5_real_connected and bool(can_execute_live)
+
+        if live_mode_requested and not mt5_real_connected:
+            raise HTTPException(
+                status_code=400,
+                detail="Live mode is enabled but MT5 is not connected (real). Connect MT5 or switch to demo mode."
+            )
+
+        if live_mode_requested and mt5_real_connected and not can_execute_live:
+            raise HTTPException(
+                status_code=400,
+                detail=(live_block_reason or "Live trading is not available."),
+            )
+
+        if is_live_mode:
+            # Execute on real MT5
+            logger.info(f"[API] Executing LIVE buy order on MT5: {request.quantity} {request.symbol}")
+            comment = f"ATW2-UI-B-{request.symbol}"[:31]
+            success, order_result, error = mt5_client.place_order(
+                request.symbol,
+                'buy',
+                request.quantity,
+                request.price,
+                comment=comment
+            )
+            
+            if not success:
+                logger.warning(f"[API] MT5 buy order failed: {error}")
+                raise HTTPException(status_code=400, detail=error or "MT5 order failed")
+            
+            logger.info(f"[API] LIVE buy order executed on MT5: {order_result}")
+
+            try:
+                live_trade_logger.record_trade(
+                    LiveTradeEvent(
+                        timestamp=datetime.utcnow().isoformat(),
+                        symbol=request.symbol,
+                        side='buy',
+                        quantity=float(request.quantity),
+                        price=float(order_result.get('price', request.price) or 0.0),
+                        order_id=str(order_result.get('order')) if order_result else None,
+                        comment=comment,
+                        source='mt5_ui',
+                    )
+                )
+            except Exception:
+                pass
+            
+            # Also record in paper trading for tracking
+            position, _ = await paper_trading_service.open_position(
+                request.symbol,
+                'buy',
+                request.quantity,
+                order_result.get('price', request.price),
+                skip_controls=True,
+                external_order_id=str(order_result.get('order')) if order_result and order_result.get('order') is not None else None
+            )
+            
+            return {
+                "status": "success",
+                "message": f"LIVE buy order executed on MT5 for {request.quantity} {request.symbol}",
+                "position": position,
+                "mt5_order": order_result,
+                "live_mode": True,
+                "live_mode_requested": True
+            }
+        else:
+            # Paper trading mode
+            position, error = await paper_trading_service.open_position(
+                request.symbol,
+                'buy',
+                request.quantity,
+                request.price,
+                skip_controls=True
+            )
+            
+            if error:
+                logger.warning(f"[API] Buy order rejected: {error}")
+                raise HTTPException(status_code=400, detail=error)
+            
+            logger.info(f"[API] Paper buy order executed: {request.quantity} {request.symbol}")
+            
+            return {
+                "status": "success",
+                "message": f"Buy order executed for {request.quantity} {request.symbol}",
+                "position": position,
+                "live_mode": False,
+                "live_mode_requested": live_mode_requested
+            }
         
     except HTTPException:
         raise
@@ -75,7 +231,7 @@ async def buy_order(request: BuyRequest):
 @router.post("/sell")
 async def sell_order(request: SellRequest):
     """
-    Place a sell order (paper trading).
+    Place a sell order (supports both live MT5 and paper trading).
     
     Opens a short position or adds to existing position.
     Creates a trade record and updates position tracking.
@@ -83,32 +239,170 @@ async def sell_order(request: SellRequest):
     """
     try:
         logger.info(f"[API] Sell order request: {request.quantity} {request.symbol}")
-        
+
+        # Backend-authoritative trading mode
+        trading_settings = await _get_or_create_trading_settings()
+        live_mode_requested = bool(trading_settings.live_mode)
+
+        # Check if MT5 is connected for live trading
+        from app.services import get_mt5_client
+        from app.services.mock_mt5 import MockMT5Client
+        from app.config import settings
+
+        mt5_client = get_mt5_client()
+        mt5_real_connected = mt5_client.is_connected and not isinstance(mt5_client, MockMT5Client)
+
+        can_execute_live, live_block_reason = (False, None)
+        if live_mode_requested and mt5_real_connected:
+            can_execute_live, live_block_reason = _mt5_can_execute_live_orders(mt5_client, settings)
+
+        is_live_mode = live_mode_requested and mt5_real_connected and bool(can_execute_live)
+
+        if live_mode_requested and not mt5_real_connected:
+            raise HTTPException(
+                status_code=400,
+                detail="Live mode is enabled but MT5 is not connected (real). Connect MT5 or switch to demo mode.",
+            )
+
+        if live_mode_requested and mt5_real_connected and not can_execute_live:
+            raise HTTPException(
+                status_code=400,
+                detail=(live_block_reason or "Live trading is not available."),
+            )
+
+        if is_live_mode:
+            # Execute on real MT5
+            logger.info(f"[API] Executing LIVE sell order on MT5: {request.quantity} {request.symbol}")
+            comment = f"ATW2-UI-S-{request.symbol}"[:31]
+            success, order_result, error = mt5_client.place_order(
+                request.symbol,
+                'sell',
+                request.quantity,
+                request.price,
+                comment=comment
+            )
+
+            if not success:
+                logger.warning(f"[API] MT5 sell order failed: {error}")
+                raise HTTPException(status_code=400, detail=error or "MT5 order failed")
+
+            logger.info(f"[API] LIVE sell order executed on MT5: {order_result}")
+
+            try:
+                live_trade_logger.record_trade(
+                    LiveTradeEvent(
+                        timestamp=datetime.utcnow().isoformat(),
+                        symbol=request.symbol,
+                        side='sell',
+                        quantity=float(request.quantity),
+                        price=float(order_result.get('price', request.price) or 0.0),
+                        order_id=str(order_result.get('order')) if order_result else None,
+                        comment=comment,
+                        source='mt5_ui',
+                    )
+                )
+            except Exception:
+                pass
+
+            # Also record in paper trading for tracking
+            position, _ = await paper_trading_service.open_position(
+                request.symbol,
+                'sell',
+                request.quantity,
+                order_result.get('price', request.price),
+                skip_controls=True,
+                external_order_id=str(order_result.get('order')) if order_result and order_result.get('order') is not None else None
+            )
+
+            return {
+                "status": "success",
+                "message": f"LIVE sell order executed on MT5 for {request.quantity} {request.symbol}",
+                "position": position,
+                "mt5_order": order_result,
+                "live_mode": True,
+                "live_mode_requested": True
+            }
+
+        # Paper trading mode
         position, error = await paper_trading_service.open_position(
             request.symbol,
             'sell',
             request.quantity,
             request.price,
-            skip_controls=True  # Manual trades skip controls
+            skip_controls=True
         )
-        
+
         if error:
             logger.warning(f"[API] Sell order rejected: {error}")
             raise HTTPException(status_code=400, detail=error)
-        
-        logger.info(f"[API] Sell order executed successfully: {request.quantity} {request.symbol}")
-        
+
+        logger.info(f"[API] Paper sell order executed: {request.quantity} {request.symbol}")
+
         return {
             "status": "success",
             "message": f"Sell order executed for {request.quantity} {request.symbol}",
-            "position": position
+            "position": position,
+            "live_mode": False,
+            "live_mode_requested": live_mode_requested
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"[API] Sell order failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Sell order failed: {str(e)}")
+
+
+@router.get("/mode", response_model=TradingModeResponse)
+async def get_trading_mode():
+    """Get backend-authoritative trading mode (live vs demo)."""
+    settings = await _get_or_create_trading_settings()
+    return TradingModeResponse(
+        live_mode=bool(settings.live_mode),
+        updated_at=settings.updated_at.isoformat() if getattr(settings, 'updated_at', None) else None,
+    )
+
+
+@router.put("/mode", response_model=TradingModeResponse)
+async def set_trading_mode(request: TradingModeRequest):
+    """Set backend-authoritative trading mode (live vs demo)."""
+    # If enabling live mode, require real MT5 connection AND server config
+    from app.services import get_mt5_client
+    from app.services.mock_mt5 import MockMT5Client
+    from app.config import settings
+
+    mt5_client = get_mt5_client()
+    mt5_real_connected = mt5_client.is_connected and not isinstance(mt5_client, MockMT5Client)
+
+    if request.live_mode and not mt5_real_connected:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot enable live mode: MT5 is not connected (real).",
+        )
+
+    if request.live_mode and mt5_real_connected:
+        can_execute_live, live_block_reason = _mt5_can_execute_live_orders(mt5_client, settings)
+        if not can_execute_live:
+            raise HTTPException(
+                status_code=400,
+                detail=(live_block_reason or "Cannot enable live mode."),
+            )
+
+    async for session in db.get_session():
+        result = await session.execute(select(TradingSettings).limit(1))
+        settings = result.scalar_one_or_none()
+        if settings is None:
+            settings = TradingSettings(live_mode=bool(request.live_mode))
+            session.add(settings)
+        else:
+            settings.live_mode = bool(request.live_mode)
+        await session.commit()
+        await session.refresh(settings)
+        return TradingModeResponse(
+            live_mode=bool(settings.live_mode),
+            updated_at=settings.updated_at.isoformat() if getattr(settings, 'updated_at', None) else None,
+        )
+
 
 
 @router.post("/close/{position_id}")
@@ -391,7 +685,30 @@ async def export_trade_history(
         raise
     except Exception as e:
         logger.error(f"Failed to export trade history: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to export trade history: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
+
+
+@router.post("/live-trades/flush")
+async def flush_live_trades_to_dataset_queue():
+    try:
+        flushed, path, err = live_trade_logger.flush_to_datasets()
+        if err:
+            raise HTTPException(status_code=500, detail=err)
+        return {
+            "status": "success",
+            "rows_flushed": int(flushed),
+            "path": path,
+            "message": (
+                f"Flushed {flushed} live trade(s) to dataset queue"
+                if flushed
+                else "No live trades to flush"
+            ),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to flush live trades: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to flush live trades: {str(e)}")
 
 
 @router.get("/summary")

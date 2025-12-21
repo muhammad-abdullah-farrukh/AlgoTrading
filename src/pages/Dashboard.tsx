@@ -5,17 +5,19 @@ import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from '@/components/ui/dialog';
 import { PriceChart } from '@/components/trading/PriceChart';
 import { StatusIndicator } from '@/components/trading/StatusIndicator';
-import { generateOHLCVData } from '@/utils/dummyData';
+import api from '@/utils/api';
 import { useTrades } from '@/contexts/TradesContext';
-import { useMockPriceStream, useWebSocket } from '@/hooks/useWebSocket';
+import { useTradingMode } from '@/contexts/TradingModeContext';
+import { useWebSocket } from '@/hooks/useWebSocket';
 import { TrendingUp, TrendingDown, Activity, DollarSign, BarChart3, AlertTriangle, Zap } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 const Dashboard = () => {
   const { trades } = useTrades();
-  const [ohlcvData] = useState(() => generateOHLCVData(60));
-  const [isLiveMode, setIsLiveMode] = useState(false);
+  const { isLiveMode, setLiveMode } = useTradingMode();
+  const [ohlcvData, setOhlcvData] = useState<Array<{ time: number; open: number; high: number; low: number; close: number; volume: number }>>([]);
   const [showModeModal, setShowModeModal] = useState(false);
+  const [currentPrice, setCurrentPrice] = useState<number | undefined>(undefined);
   const [positions, setPositions] = useState<Array<{
     id: number;
     symbol: string;
@@ -64,18 +66,52 @@ const Dashboard = () => {
     reconnectAttempts: 5,
   });
 
-  // Mock price stream - only use if WebSocket is not connected
-  const { price, isStreaming, startStream, stopStream } = useMockPriceStream('EURUSD', ohlcvData[ohlcvData.length - 1]?.close);
+  // Live tick stream for current price
+  const { isConnected: isTickConnected } = useWebSocket({
+    url: '/ws/ticks/EURUSD',
+    onMessage: (data) => {
+      if (data && typeof data === 'object' && 'type' in data) {
+        const msg = data as { type: string; bid?: number; ask?: number };
+        if (msg.type === 'tick' && msg.bid !== undefined) {
+          const midPrice = msg.ask !== undefined ? (msg.bid + msg.ask) / 2 : msg.bid;
+          setCurrentPrice(Number(midPrice.toFixed(5)));
+        }
+      }
+    },
+    autoConnect: true,
+    reconnectAttempts: 5,
+  });
 
+  // Load real OHLCV for the chart
   useEffect(() => {
-    // Only start mock stream if WebSocket is not connected
-    if (!isPositionsConnected) {
-      startStream();
-    } else {
-      stopStream();
-    }
-    return () => stopStream();
-  }, [isPositionsConnected, startStream, stopStream]);
+    let isMounted = true;
+    (async () => {
+      try {
+        const res = await api.get<{ ohlcv: Array<{ timestamp: string; open: number; high: number; low: number; close: number; volume: number }> }>('/api/indicators/ohlcv', {
+          params: { symbol: 'EURUSD', timeframe: '1d', limit: 200 },
+        });
+        if (!isMounted) return;
+        const mapped = (res.ohlcv || []).map((b) => ({
+          time: new Date(b.timestamp).getTime(),
+          open: b.open,
+          high: b.high,
+          low: b.low,
+          close: b.close,
+          volume: b.volume,
+        }));
+        setOhlcvData(mapped);
+        if (mapped.length && currentPrice === undefined) {
+          setCurrentPrice(mapped[mapped.length - 1].close);
+        }
+      } catch (e) {
+        console.error('[Dashboard] Failed to load OHLCV:', e);
+      }
+    })();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   const stats = useMemo(() => {
     const totalPnL = trades.reduce((sum, t) => sum + t.profitLoss, 0);
@@ -102,12 +138,12 @@ const Dashboard = () => {
   };
 
   const confirmLiveMode = () => {
-    setIsLiveMode(true);
+    setLiveMode(true);
     setShowModeModal(false);
   };
 
   const stayInDemo = () => {
-    setIsLiveMode(false);
+    setLiveMode(false);
     setShowModeModal(false);
   };
 
@@ -120,7 +156,7 @@ const Dashboard = () => {
           <p className="text-muted-foreground">Real-time market overview and trading performance</p>
         </div>
         <div className="flex items-center gap-4">
-          <StatusIndicator status={isStreaming ? 'connected' : 'disconnected'} label="Live Feed" />
+          <StatusIndicator status={isTickConnected ? 'connected' : 'disconnected'} label="Live Feed" />
           <Button
             variant={isLiveMode ? "default" : "secondary"}
             size="sm"
@@ -227,7 +263,7 @@ const Dashboard = () => {
       </div>
 
       {/* Price Chart */}
-      <PriceChart data={ohlcvData} symbol="EURUSD" currentPrice={price} />
+      <PriceChart data={ohlcvData} symbol="EURUSD" currentPrice={currentPrice} />
 
       {/* Recent Trades */}
       <Card className="bg-card border-border">

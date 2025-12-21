@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
@@ -15,9 +15,7 @@ import {
   Shield, 
   Zap,
   Brain,
-  Activity,
-  Sparkles,
-  Play
+  Activity
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { toast } from '@/hooks/use-toast';
@@ -40,54 +38,107 @@ interface RiskControl {
   max: number;
   step: number;
   unit: string;
-  aiEnabled: boolean;
 }
 
-const mockRecommendations: AIRecommendation[] = [
-  {
-    id: '1',
-    symbol: 'EURUSD',
-    action: 'BUY',
-    confidence: 0.85,
-    reason: 'Strong bullish divergence on RSI with EMA crossover confirmation',
-    timestamp: new Date()
-  },
-  {
-    id: '2',
-    symbol: 'GBPUSD',
-    action: 'SELL',
-    confidence: 0.72,
-    reason: 'Bearish engulfing pattern at key resistance level',
-    timestamp: new Date(Date.now() - 300000)
-  },
-  {
-    id: '3',
-    symbol: 'USDJPY',
-    action: 'HOLD',
-    confidence: 0.45,
-    reason: 'Market indecision - awaiting clearer price action signals',
-    timestamp: new Date(Date.now() - 600000)
-  }
-];
-
 const initialRiskControls: RiskControl[] = [
-  { id: 'stopLoss', label: 'Stop Loss', value: 2.0, min: 0.5, max: 10, step: 0.5, unit: '%', aiEnabled: false },
-  { id: 'takeProfit', label: 'Take Profit', value: 4.0, min: 1, max: 20, step: 0.5, unit: '%', aiEnabled: false },
-  { id: 'maxDailyLoss', label: 'Max Daily Loss', value: 5.0, min: 1, max: 15, step: 0.5, unit: '%', aiEnabled: true },
-  { id: 'positionSize', label: 'Position Size', value: 0.1, min: 0.01, max: 1, step: 0.01, unit: 'Lots', aiEnabled: false },
+  { id: 'stopLoss', label: 'Stop Loss', value: 2.0, min: 0.5, max: 10, step: 0.5, unit: '%' },
+  { id: 'takeProfit', label: 'Take Profit', value: 4.0, min: 1, max: 20, step: 0.5, unit: '%' },
+  { id: 'maxDailyLoss', label: 'Max Daily Loss', value: 5.0, min: 1, max: 15, step: 0.5, unit: '%' },
+  { id: 'positionSize', label: 'Position Size', value: 0.1, min: 0.01, max: 1, step: 0.01, unit: 'Lots' },
 ];
 
 const Autotrading = () => {
-  const [isAutotradingEnabled, setIsAutotradingEnabled] = useState(false);
-  const [riskLevel, setRiskLevel] = useState([50]);
-  const [maxPositions, setMaxPositions] = useState([3]);
-  const [recommendations] = useState<AIRecommendation[]>(mockRecommendations);
+  // Initialize with null to distinguish between "not loaded" and "disabled"
+  const [isAutotradingEnabled, setIsAutotradingEnabled] = useState<boolean | null>(null);
+  const [recommendations, setRecommendations] = useState<AIRecommendation[]>([]);
   const [riskControls, setRiskControls] = useState<RiskControl[]>(initialRiskControls);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
+  const [selectedSymbol, setSelectedSymbol] = useState('EURUSD');
+  const [selectedTimeframe, setSelectedTimeframe] = useState('1d');
+  const hasLoadedRecsRef = useRef(false);
+
+  const SYMBOLS = useMemo(
+    () => ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'BTCUSDT', 'AAPL'],
+    []
+  );
+  const TIMEFRAMES = useMemo(
+    () => [
+      { value: '1m', label: '1m' },
+      { value: '3m', label: '3m' },
+      { value: '5m', label: '5m' },
+      { value: '6m', label: '6m' },
+      { value: '12m', label: '12m' },
+      { value: '15m', label: '15m' },
+      { value: '30m', label: '30m' },
+      { value: '45m', label: '45m' },
+      { value: '1h', label: '1h' },
+      { value: '2h', label: '2h' },
+      { value: '3h', label: '3h' },
+      { value: '4h', label: '4h' },
+      { value: '1d', label: '1d' },
+      { value: '1w', label: '1w' },
+      { value: '1M', label: '1M' },
+      { value: '3M', label: '3M' },
+      { value: '6M', label: '6M' },
+      { value: '12M', label: '12M' },
+    ],
+    []
+  );
+
+  const timeframeToMs = (tf: string): number => {
+    const norm = String(tf || '').trim();
+    const map: Record<string, number> = {
+      '1m': 60_000,
+      '3m': 180_000,
+      '5m': 300_000,
+      '6m': 360_000,
+      '12m': 720_000,
+      '15m': 900_000,
+      '30m': 1_800_000,
+      '45m': 2_700_000,
+      '1h': 3_600_000,
+      '2h': 7_200_000,
+      '3h': 10_800_000,
+      '4h': 14_400_000,
+      '1d': 86_400_000,
+      '1w': 604_800_000,
+      '1M': 2_592_000_000,
+      '3M': 7_776_000_000,
+      '6M': 15_552_000_000,
+      '12M': 31_536_000_000,
+    };
+    return map[norm] ?? map[norm.toLowerCase()] ?? 60_000;
+  };
+
+  const fetchRecommendations = async () => {
+    try {
+      const res = await api.get<{
+        signals: Array<{ symbol: string; signal: string; confidence: number; reason: string; timestamp?: string }>;
+      }>('/api/ml/signals', {
+        params: { symbols: selectedSymbol, timeframe: selectedTimeframe, min_confidence: 0.5 }
+      });
+
+      const recs: AIRecommendation[] = (res.signals || []).slice(0, 10).map((s, idx) => ({
+        id: `${s.symbol}-${s.timestamp || idx}`,
+        symbol: s.symbol,
+        action: (s.signal || 'HOLD') as 'BUY' | 'SELL' | 'HOLD',
+        confidence: Number(s.confidence || 0),
+        reason: s.reason || '',
+        timestamp: s.timestamp ? new Date(s.timestamp) : new Date(),
+      }));
+      setRecommendations(recs);
+      hasLoadedRecsRef.current = true;
+    } catch (error) {
+      console.error('[Autotrading] Failed to load AI recommendations:', error);
+      if (!hasLoadedRecsRef.current) setRecommendations([]);
+    }
+  };
 
   // Fetch settings from backend on mount
   useEffect(() => {
+    let isMounted = true; // Track if component is still mounted
+    
     const fetchSettings = async () => {
       try {
         setIsLoading(true);
@@ -100,82 +151,107 @@ const Autotrading = () => {
           selected_strategy_id: number | null;
         }>('/api/autotrading/settings');
         
-        // Update state from backend
-        setIsAutotradingEnabled(settings.enabled || false);
+        // Only update state if component is still mounted
+        if (isMounted) {
+          // Update state from backend (ALWAYS sync with backend)
+          setIsAutotradingEnabled(settings.enabled || false);
         
-        // Update risk controls from backend
-        setRiskControls(prev => prev.map(rc => {
-          if (rc.id === 'stopLoss' && settings.stop_loss_percent !== null) {
-            return { ...rc, value: settings.stop_loss_percent };
-          }
-          if (rc.id === 'takeProfit' && settings.take_profit_percent !== null) {
-            return { ...rc, value: settings.take_profit_percent };
-          }
-          if (rc.id === 'maxDailyLoss' && settings.max_daily_loss !== null) {
-            return { ...rc, value: settings.max_daily_loss };
-          }
-          if (rc.id === 'positionSize' && settings.position_size !== null) {
-            return { ...rc, value: settings.position_size };
-          }
-          return rc;
-        }));
-        
-        console.log('[Autotrading] Loaded persisted settings from backend:', settings);
+          // Update risk controls from backend
+          setRiskControls(prev => prev.map(rc => {
+            if (rc.id === 'stopLoss' && settings.stop_loss_percent !== null) {
+              return { ...rc, value: settings.stop_loss_percent };
+            }
+            if (rc.id === 'takeProfit' && settings.take_profit_percent !== null) {
+              return { ...rc, value: settings.take_profit_percent };
+            }
+            if (rc.id === 'maxDailyLoss' && settings.max_daily_loss !== null) {
+              return { ...rc, value: settings.max_daily_loss };
+            }
+            if (rc.id === 'positionSize' && settings.position_size !== null) {
+              return { ...rc, value: settings.position_size };
+            }
+            return rc;
+          }));
+          
+          console.log('[Autotrading] Loaded persisted settings from backend:', settings);
+        }
       } catch (error) {
         console.error('[Autotrading] Failed to load settings:', error);
-        if (error instanceof APIError && error.status !== 404) {
-          toast({
-            title: "Failed to Load Settings",
-            description: "Could not load autotrading settings from backend.",
-            variant: "destructive"
-          });
+        if (isMounted) {
+          if (error instanceof APIError && error.status !== 404) {
+            toast({
+              title: "Failed to Load Settings",
+              description: "Could not load autotrading settings from backend.",
+              variant: "destructive"
+            });
+          }
+          setIsAutotradingEnabled(false);
+          setIsLoading(false);
         }
       } finally {
-        setIsLoading(false);
+        if (isMounted) {
+          setIsLoading(false);
+        }
       }
     };
     
+    // Fetch immediately
     fetchSettings();
+    
+    return () => {
+      isMounted = false; // Mark as unmounted
+    };
   }, []);
 
+  useEffect(() => {
+    (async () => {
+      try {
+        await api.put('/api/autotrading/settings', { timeframe: selectedTimeframe });
+      } catch (e) {
+        console.error('[Autotrading] Failed to persist timeframe:', e);
+      }
+    })();
+  }, [selectedTimeframe]);
+
+  useEffect(() => {
+    fetchRecommendations();
+    const intervalId = window.setInterval(
+      fetchRecommendations,
+      Math.min(60_000, Math.max(10_000, timeframeToMs(selectedTimeframe)))
+    );
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [selectedSymbol, selectedTimeframe]);
+
   const handleToggleAutotrading = async (enabled: boolean) => {
+    // Prevent toggling while loading or if state is null
+    if (isAutotradingEnabled === null || isSaving) {
+      return;
+    }
+    
     try {
       setIsSaving(true);
       const endpoint = enabled ? '/api/autotrading/enable' : '/api/autotrading/disable';
       await api.post(endpoint);
       
+      // Update state immediately for responsive UI
       setIsAutotradingEnabled(enabled);
       console.log('[Autotrading] State persisted to backend: enabled=', enabled);
       
-      // Auto-start the loop when enabling
-      if (enabled) {
-        try {
-          await api.post('/api/autotrading/start-loop');
-          console.log('[Autotrading] Background loop started');
-        } catch (loopError) {
-          console.warn('[Autotrading] Failed to start loop:', loopError);
-          // Non-critical, continue
-        }
-      } else {
-        // Stop the loop when disabling
-        try {
-          await api.post('/api/autotrading/stop-loop');
-          console.log('[Autotrading] Background loop stopped');
-        } catch (loopError) {
-          console.warn('[Autotrading] Failed to stop loop:', loopError);
-          // Non-critical, continue
-        }
-      }
-      
+      // Loop is automatically started/stopped by backend when enabling/disabling
       toast({
         title: enabled ? "Autotrading Enabled" : "Autotrading Disabled",
         description: enabled 
-          ? "AI will now execute trades based on strategy signals." 
+          ? "AI is now automatically executing trades based on signals every minute." 
           : "Automatic trading has been paused.",
         variant: enabled ? "default" : "destructive"
       });
     } catch (error) {
       console.error('[Autotrading] Failed to update autotrading state:', error);
+      // Revert state on error
+      setIsAutotradingEnabled(!enabled);
       toast({
         title: "Update Failed",
         description: "Could not save autotrading state to backend.",
@@ -186,36 +262,6 @@ const Autotrading = () => {
     }
   };
 
-  const handleExecuteStrategy = async () => {
-    try {
-      setIsSaving(true);
-      const response = await api.post<{
-        status: string;
-        message: string;
-        executed_trades?: Array<any>;
-        skipped_signals?: Array<any>;
-      }>('/api/autotrading/execute-strategy');
-      
-      toast({
-        title: "Strategy Executed",
-        description: response.message || "Trading strategy executed successfully",
-        variant: "default"
-      });
-      
-      if (response.executed_trades && response.executed_trades.length > 0) {
-        console.log('[Autotrading] Executed trades:', response.executed_trades);
-      }
-    } catch (error) {
-      console.error('[Autotrading] Failed to execute strategy:', error);
-      toast({
-        title: "Execution Failed",
-        description: "Could not execute trading strategy.",
-        variant: "destructive"
-      });
-    } finally {
-      setIsSaving(false);
-    }
-  };
 
   const updateRiskControl = async (id: string, value: number) => {
     // Update local state immediately
@@ -249,20 +295,6 @@ const Autotrading = () => {
     }
   };
 
-  const toggleAIControl = (id: string) => {
-    setRiskControls(prev => prev.map(rc => {
-      if (rc.id === id) {
-        const newAiEnabled = !rc.aiEnabled;
-        toast({
-          title: newAiEnabled ? "AI Control Enabled" : "Manual Control",
-          description: `${rc.label} is now ${newAiEnabled ? 'controlled by AI' : 'manually configured'}`,
-        });
-        return { ...rc, aiEnabled: newAiEnabled };
-      }
-      return rc;
-    }));
-  };
-
   const getActionColor = (action: string) => {
     switch (action) {
       case 'BUY': return 'text-success';
@@ -281,95 +313,121 @@ const Autotrading = () => {
 
   return (
     <div className="space-y-6 animate-fade-in">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-bold text-foreground">Autotrading Control</h1>
-          <p className="text-muted-foreground">Configure AI-powered automated trading</p>
-        </div>
-        <div className="flex items-center gap-4">
-          <StatusIndicator 
-            status={isAutotradingEnabled ? 'connected' : 'disconnected'} 
-            label={isAutotradingEnabled ? 'Active' : 'Inactive'} 
-          />
-        </div>
+    {/* Header */}
+    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+      <div>
+        <h1 className="text-3xl font-bold text-foreground">Autotrading Control</h1>
+        <p className="text-muted-foreground">Automated trading with AI-powered risk management</p>
       </div>
+      <div className="flex items-center gap-4">
+        <StatusIndicator 
+          status={isAutotradingEnabled === true ? 'connected' : 'disconnected'} 
+          label={isAutotradingEnabled === true ? 'Active' : isAutotradingEnabled === null ? 'Loading...' : 'Inactive'} 
+        />
+      </div>
+    </div>
 
-      <div className="grid gap-6 lg:grid-cols-2">
-        {/* Main Control Panel */}
-        <Card className={cn(
-          "bg-card border-2 transition-all duration-300",
-          isAutotradingEnabled ? "border-ai-purple shadow-lg shadow-ai-purple/10" : "border-border"
-        )}>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Bot className="h-5 w-5 text-ai-purple" />
-              Autotrading Control
-            </CardTitle>
-            <CardDescription>
-              Enable or disable AI-powered automatic trading execution
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-6">
-            <div className="flex items-center justify-between p-4 rounded-lg bg-muted/50">
-              <div className="flex items-center gap-3">
-                <div className={cn(
-                  "p-3 rounded-full transition-colors",
-                  isAutotradingEnabled ? "bg-ai-purple/20" : "bg-muted"
-                )}>
-                  <Zap className={cn(
-                    "h-6 w-6 transition-colors",
-                    isAutotradingEnabled ? "text-ai-purple" : "text-muted-foreground"
-                  )} />
-                </div>
-                <div>
-                  <p className="font-semibold text-foreground">
-                    {isAutotradingEnabled ? 'Autotrading Active' : 'Autotrading Inactive'}
-                  </p>
-                  <p className="text-sm text-muted-foreground">
-                    {isAutotradingEnabled 
-                      ? 'AI is monitoring markets and executing trades' 
-                      : 'Toggle to enable automatic trade execution'}
-                  </p>
-                </div>
+    <div className="grid gap-6 md:grid-cols-2">
+      <Card className="bg-card/50 border-border/50 md:col-span-2">
+        <CardHeader>
+          <CardTitle className="text-lg font-semibold">AI Recommendations Filter</CardTitle>
+          <CardDescription className="text-xs">Recommendations update every 10s</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-2">
+            <Label>Symbol</Label>
+            <select
+              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+              value={selectedSymbol}
+              onChange={(e) => setSelectedSymbol(e.target.value)}
+            >
+              {SYMBOLS.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="space-y-2">
+            <Label>Timeframe</Label>
+            <select
+              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+              value={selectedTimeframe}
+              onChange={(e) => setSelectedTimeframe(e.target.value)}
+            >
+              {TIMEFRAMES.map((t) => (
+                <option key={t.value} value={t.value}>
+                  {t.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Main Control Panel */}
+      <Card className={cn(
+        "bg-card border-2 transition-all duration-300",
+        isAutotradingEnabled === true ? "border-ai-purple shadow-lg shadow-ai-purple/10" : "border-border"
+      )}>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Bot className="h-5 w-5 text-ai-purple" />
+            Autotrading Control
+          </CardTitle>
+          <CardDescription>
+            Enable or disable AI-powered automatic trading execution
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          <div className="flex items-center justify-between p-4 rounded-lg bg-muted/50">
+            <div className="flex items-center gap-3">
+              <div className={cn(
+                "p-3 rounded-full transition-colors",
+                isAutotradingEnabled === true ? "bg-ai-purple/20" : "bg-muted"
+              )}>
+                <Zap className={cn(
+                  "h-6 w-6 transition-colors",
+                  isAutotradingEnabled === true ? "text-ai-purple" : "text-muted-foreground"
+                )} />
               </div>
-              <Switch
-                checked={isAutotradingEnabled}
-                onCheckedChange={handleToggleAutotrading}
-                disabled={isLoading || isSaving}
-              />
+              <div>
+                <p className="font-semibold text-foreground">
+                  {isAutotradingEnabled === true ? 'Autotrading Active' : isAutotradingEnabled === null ? 'Loading...' : 'Autotrading Inactive'}
+                </p>
+                <p className="text-sm text-muted-foreground">
+                  {isAutotradingEnabled === true
+                    ? 'AI is monitoring markets and executing trades'
+                    : isAutotradingEnabled === null
+                    ? 'Loading autotrading status...'
+                    : 'Toggle to enable automatic trade execution'}
+                </p>
+              </div>
             </div>
+            <Switch
+              checked={isAutotradingEnabled ?? false}
+              onCheckedChange={handleToggleAutotrading}
+              disabled={isLoading || isSaving || isAutotradingEnabled === null}
+            />
+          </div>
 
-            {isAutotradingEnabled && (
-              <div className="flex gap-2">
-                <Button
-                  onClick={handleExecuteStrategy}
-                  disabled={isSaving}
-                  className="flex-1"
-                >
-                  <Play className="h-4 w-4 mr-2" />
-                  Execute Strategy Now
-                </Button>
-              </div>
-            )}
-
-            {isAutotradingEnabled && (
-              <div className="p-4 rounded-lg bg-warning/10 border border-warning/20 animate-fade-in">
-                <div className="flex items-start gap-3">
-                  <AlertTriangle className="h-5 w-5 text-warning mt-0.5" />
-                  <div>
-                    <p className="font-medium text-warning">Caution: Live Trading</p>
-                    <p className="text-sm text-muted-foreground">
-                      The bot will execute real trades based on AI signals. Monitor closely.
-                    </p>
-                  </div>
+          {isAutotradingEnabled === true && (
+            <div className="p-4 rounded-lg bg-warning/10 border border-warning/20 animate-fade-in">
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="h-5 w-5 text-warning mt-0.5" />
+                <div>
+                  <p className="font-medium text-warning">Caution: Live Trading</p>
+                  <p className="text-sm text-muted-foreground">
+                    The bot will execute real trades based on AI signals. Monitor closely.
+                  </p>
                 </div>
               </div>
-            )}
-          </CardContent>
-        </Card>
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
-        {/* Basic Risk Settings */}
+        {/* Risk Settings */}
         <Card className="bg-card border-border">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -377,97 +435,17 @@ const Autotrading = () => {
               Risk Settings
             </CardTitle>
             <CardDescription>
-              Configure trading limits and risk parameters
+              Configure persisted risk parameters
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <Label>Risk Level</Label>
-                <Badge variant="outline">{riskLevel[0]}%</Badge>
-              </div>
-              <Slider
-                value={riskLevel}
-                onValueChange={setRiskLevel}
-                max={100}
-                step={5}
-                className="w-full"
-              />
-              <p className="text-xs text-muted-foreground">
-                {riskLevel[0] < 30 ? 'Conservative' : riskLevel[0] < 70 ? 'Moderate' : 'Aggressive'} risk tolerance
-              </p>
-            </div>
-
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <Label>Max Concurrent Positions</Label>
-                <Badge variant="outline">{maxPositions[0]}</Badge>
-              </div>
-              <Slider
-                value={maxPositions}
-                onValueChange={setMaxPositions}
-                max={10}
-                min={1}
-                step={1}
-                className="w-full"
-              />
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Advanced Risk Management with AI Toggle */}
-      <Card className="bg-card border-border">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Sparkles className="h-5 w-5 text-ai-purple" />
-            Advanced Risk Management
-          </CardTitle>
-          <CardDescription>
-            Configure individual risk controls with optional AI automation
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="grid gap-4 sm:grid-cols-2">
-            {riskControls.map((control) => (
-              <div 
-                key={control.id} 
-                className={cn(
-                  "p-4 rounded-lg border transition-all duration-300",
-                  control.aiEnabled 
-                    ? "bg-ai-purple/5 border-ai-purple/30" 
-                    : "bg-muted/30 border-border"
-                )}
-              >
-                <div className="flex items-center justify-between mb-3">
-                  <Label className="font-medium">{control.label}</Label>
-                  <div className="flex items-center gap-2">
-                    {control.aiEnabled && (
-                      <Badge variant="secondary" className="bg-ai-purple/20 text-ai-purple text-xs">
-                        <Brain className="h-3 w-3 mr-1" />
-                        AI
-                      </Badge>
-                    )}
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => toggleAIControl(control.id)}
-                      className={cn(
-                        "h-7 px-2 text-xs",
-                        control.aiEnabled ? "text-ai-purple" : "text-muted-foreground"
-                      )}
-                    >
-                      {control.aiEnabled ? 'Manual' : 'Auto (AI)'}
-                    </Button>
+            <div className="grid gap-4 sm:grid-cols-2">
+              {riskControls.map((control) => (
+                <div key={control.id} className="p-4 rounded-lg border bg-muted/30 border-border">
+                  <div className="flex items-center justify-between mb-3">
+                    <Label className="font-medium">{control.label}</Label>
                   </div>
-                </div>
-                
-                {control.aiEnabled ? (
-                  <div className="flex items-center gap-2 p-3 rounded bg-ai-purple/10">
-                    <Brain className="h-4 w-4 text-ai-purple" />
-                    <span className="text-sm text-muted-foreground">AI is managing this parameter</span>
-                  </div>
-                ) : (
+
                   <div className="space-y-2">
                     <div className="flex items-center gap-2">
                       <Input
@@ -490,78 +468,80 @@ const Autotrading = () => {
                       className="w-full"
                     />
                   </div>
-                )}
-              </div>
-            ))}
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* AI Recommendations */}
-      <Card className="bg-card border-border">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Brain className="h-5 w-5 text-ai-purple" />
-            AI Trading Recommendations
-          </CardTitle>
-          <CardDescription>
-            Real-time AI-generated trading signals based on market analysis
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-4">
-            {recommendations.map((rec) => {
-              const ActionIcon = getActionIcon(rec.action);
-              return (
-                <div 
-                  key={rec.id}
-                  className="flex items-start gap-4 p-4 rounded-lg bg-muted/50 hover:bg-muted/70 transition-colors"
-                >
-                  <div className={cn(
-                    "p-2 rounded-full",
-                    rec.action === 'BUY' ? 'bg-success/10' : 
-                    rec.action === 'SELL' ? 'bg-destructive/10' : 'bg-warning/10'
-                  )}>
-                    <ActionIcon className={cn("h-5 w-5", getActionColor(rec.action))} />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-1">
-                      <span className="font-semibold text-foreground">{rec.symbol}</span>
-                      <Badge 
-                        variant={rec.action === 'BUY' ? 'default' : rec.action === 'SELL' ? 'destructive' : 'secondary'}
-                      >
-                        {rec.action}
-                      </Badge>
-                      <Badge variant="outline" className="bg-ai-purple/10 text-ai-purple border-0">
-                        {(rec.confidence * 100).toFixed(0)}% confidence
-                      </Badge>
-                    </div>
-                    <p className="text-sm text-muted-foreground">{rec.reason}</p>
-                    <p className="text-xs text-muted-foreground mt-1">
-                      {rec.timestamp.toLocaleTimeString()}
-                    </p>
-                  </div>
-                  <Button 
-                    variant="outline" 
-                    size="sm"
-                    disabled={!isAutotradingEnabled}
-                    className="hover:bg-ai-purple/10 hover:text-ai-purple hover:border-ai-purple/30"
-                  >
-                    Execute
-                  </Button>
                 </div>
-              );
-            })}
-          </div>
-          
-          <div className="mt-4 p-4 rounded-lg bg-muted/30 border border-dashed border-border">
-            <p className="text-sm text-muted-foreground text-center">
-              <Brain className="h-4 w-4 inline mr-1" />
-              Connect to Python ML backend for live AI recommendations
-            </p>
-          </div>
-        </CardContent>
-      </Card>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* AI Recommendations */}
+        <Card className="bg-card border-border">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Brain className="h-5 w-5 text-ai-purple" />
+              AI Trading Recommendations
+            </CardTitle>
+            <CardDescription>
+              Real-time AI-generated trading signals based on market analysis
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-4">
+              {recommendations.length === 0 ? (
+                <div className="p-4 rounded-lg bg-muted/50">
+                  <p className="text-sm text-muted-foreground">No recommendations available.</p>
+                </div>
+              ) : (
+                recommendations.map((rec) => {
+                  const ActionIcon = getActionIcon(rec.action);
+                  return (
+                    <div
+                      key={rec.id}
+                      className="flex items-start gap-4 p-4 rounded-lg bg-muted/50 hover:bg-muted/70 transition-colors"
+                    >
+                      <div
+                        className={cn(
+                          "p-2 rounded-full",
+                          rec.action === 'BUY'
+                            ? 'bg-success/10'
+                            : rec.action === 'SELL'
+                              ? 'bg-destructive/10'
+                              : 'bg-warning/10'
+                        )}
+                      >
+                        <ActionIcon className={cn('h-5 w-5', getActionColor(rec.action))} />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="font-semibold text-foreground">{rec.symbol}</span>
+                          <Badge
+                            variant={rec.action === 'BUY' ? 'default' : rec.action === 'SELL' ? 'destructive' : 'secondary'}
+                          >
+                            {rec.action}
+                          </Badge>
+                          <Badge variant="outline" className="bg-ai-purple/10 text-ai-purple border-0">
+                            {(rec.confidence * 100).toFixed(0)}% confidence
+                          </Badge>
+                        </div>
+                        <p className="text-sm text-muted-foreground">{rec.reason}</p>
+                        <p className="text-xs text-muted-foreground mt-1">{rec.timestamp.toLocaleTimeString()}</p>
+                      </div>
+                      <Button 
+                        variant="outline" 
+                        size="sm"
+                        disabled={!isAutotradingEnabled || isAutotradingEnabled === null}
+                        className="hover:bg-ai-purple/10 hover:text-ai-purple hover:border-ai-purple/30"
+                      >
+                        Execute
+                      </Button>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
     </div>
   );
 };

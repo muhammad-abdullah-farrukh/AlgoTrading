@@ -1,0 +1,13 @@
+metric,value,description
+accuracy,0.785808,Model accuracy on test set
+sample_size,110414,Total number of samples used for training
+train_size,88331,Number of samples in training set
+test_size,22083,Number of samples in test set
+feature_count,30,Number of features used in model
+last_trained,2025-12-19T04:09:12.352795,Timestamp when model was last trained
+last_retrained,2025-12-19T04:09:12.352795,Timestamp when model was last retrained
+model_type,logistic_regression,Type of ML model
+timeframe,1d,Timeframe used for training
+dataset_source,Foreign_Exchange_Rates.csv,Dataset files used for training
+feature_list,"return_lag_1, return_lag_2, return_lag_3, return_lag_5, return_lag_10, sma_5, ema_5, price_to_sma_5, price_to_ema_5, sma_10, ema_10, price_to_sma_10, price_to_ema_10, sma_20, ema_20, price_to_sma_20, price_to_ema_20, sma_50, ema_50, price_to_sma_50, price_to_ema_50, sma_100, ema_100, price_to_sma_100, price_to_ema_100, price_change, price_change_pct, volatility_5, volatility_10, volatility_20",List of features used in the model
+preprocessing_steps,"Normalized dataset format (wide to long if needed); Feature engineering: lagged returns (1, 2, 3, 5, 10 periods); Feature engineering: moving averages (SMA/EMA for windows 5, 10, 20, 50, 100); Feature engineering: price differences (high-low, close-open); Target variable: binary classification (1=price up, 0=price down); Train/test split (80/20 default); Class balancing (balanced class weights)",Preprocessing and feature engineering steps applied

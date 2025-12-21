@@ -686,7 +686,8 @@ class ScraperService:
         self,
         symbol: str,
         sources: List[str],
-        source_params: Optional[Dict[str, Dict]] = None
+        source_params: Optional[Dict[str, Dict]] = None,
+        progress_key: Optional[str] = None
     ) -> Dict[str, Dict]:
         """
         Scrape from multiple sources simultaneously until minimum rows reached.
@@ -699,13 +700,19 @@ class ScraperService:
         Returns:
             Dictionary with results from each source
         """
-        progress_key = f"{symbol}_{datetime.utcnow().isoformat()}"
-        self._progress[progress_key] = {
-            'symbol': symbol,
-            'sources': {},
-            'total_rows': 0,
-            'status': 'running'
-        }
+        if not progress_key:
+            progress_key = f"{symbol}_{datetime.utcnow().isoformat()}"
+
+        if progress_key not in self._progress:
+            self._progress[progress_key] = {
+                'symbol': symbol,
+                'sources': {},
+                'total_rows': 0,
+                'status': 'running'
+            }
+        else:
+            self._progress[progress_key]['symbol'] = symbol
+            self._progress[progress_key]['status'] = 'running'
         
         if source_params is None:
             source_params = {}
@@ -760,8 +767,10 @@ class ScraperService:
                 rows, error = result
                 if error:
                     logger.warning(f"Source {source_name} failed: {error}")
+                    self._update_progress(progress_key, source_name, "failed", int(rows or 0), error)
                 else:
                     logger.info(f"Source {source_name} completed: {rows} rows")
+                    self._update_progress(progress_key, source_name, "completed", int(rows or 0), f"Completed: {rows} rows")
         
         # Check total rows in database
         async for session in db.get_session():

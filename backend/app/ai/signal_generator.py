@@ -51,11 +51,59 @@ class SignalGenerator:
                     "Please install it with: pip install scikit-learn"
                 )
         self.model = logistic_model
+        self._loaded_model_path: Optional[str] = None
+        self._loaded_model_timeframe: Optional[str] = None
         logger.debug("SignalGenerator initialized")
+
+    def _get_models_dir(self) -> Path:
+        if not hasattr(self, '_models_dir'):
+            current_file = Path(__file__).resolve()
+            self._models_dir = current_file.parent / "models"
+        return self._models_dir
+
+    def _get_latest_model_path(self, timeframe: str) -> Optional[Path]:
+        models_dir = self._get_models_dir()
+        model_files = list(models_dir.glob(f"logistic_regression_{timeframe}_*.pkl"))
+        if not model_files:
+            return None
+        model_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return model_files[0]
+
+    def resolve_model_timeframe(self, requested_timeframe: str) -> Optional[str]:
+        """Resolve which timeframe's trained model should be used for a request."""
+        requested_timeframe = str(requested_timeframe or '').strip() or '1d'
+        if requested_timeframe.endswith('M') and requested_timeframe[:-1].isdigit():
+            # Preserve month token (UI uses uppercase M)
+            normalized = requested_timeframe
+        else:
+            normalized = requested_timeframe.lower()
+
+        if self._check_model_exists(normalized):
+            return normalized
+
+        available = self.get_available_timeframes()
+        if not available:
+            return None
+
+        if '1d' in available:
+            return '1d'
+
+        # Fallback to the newest model file across all timeframes
+        models_dir = self._get_models_dir()
+        all_model_files = list(models_dir.glob("logistic_regression_*.pkl"))
+        if not all_model_files:
+            return None
+        newest = max(all_model_files, key=lambda p: p.stat().st_mtime)
+
+        parts = newest.stem.split('_')
+        if len(parts) >= 3:
+            return parts[2]
+        return available[-1]
     
     def _check_model_exists(self, timeframe: str) -> bool:
         """
         Check if a trained model exists for the given timeframe.
+        ULTRA-FAST: Minimal file system operations, no logging.
         
         Args:
             timeframe: Timeframe string (e.g., '1h', '1d', '1w')
@@ -63,23 +111,8 @@ class SignalGenerator:
         Returns:
             True if model exists, False otherwise
         """
-        # Get models directory
-        current_file = Path(__file__).resolve()
-        models_dir = current_file.parent / "models"
-        
-        # Look for model files matching the timeframe
-        model_files = list(models_dir.glob(f"logistic_regression_{timeframe}_*.pkl"))
-        
-        if not model_files:
-            logger.warning(f"No trained model found for timeframe: {timeframe}")
-            return False
-        
-        # Sort by modification time (newest first)
-        model_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        latest_model = model_files[0]
-        
-        logger.debug(f"Found model for timeframe {timeframe}: {latest_model.name}")
-        return True
+        models_dir = self._get_models_dir()
+        return any(models_dir.glob(f"logistic_regression_{timeframe}_*.pkl"))
     
     def _prepare_features_from_data(
         self,
@@ -226,39 +259,54 @@ class SignalGenerator:
                 'error': Optional[str]
             }
         """
-        logger.info(f"Generating signal for timeframe: {timeframe}")
-        
         result = {
             'signal': self.SIGNAL_HOLD,
             'confidence': 0.0,
             'prediction': None,
             'probability': None,
             'timeframe': timeframe,
+            'model_timeframe': None,
             'model_available': False,
             'error': None
         }
         
         try:
-            # 1. Check if model exists
-            if not self._check_model_exists(timeframe):
-                result['error'] = f"No trained model found for timeframe: {timeframe}"
-                logger.warning(result['error'])
+            raw_timeframe = str(timeframe or '').strip() or '1d'
+            requested_timeframe = raw_timeframe if (raw_timeframe.endswith('M') and raw_timeframe[:-1].isdigit()) else raw_timeframe.lower()
+            model_timeframe = self.resolve_model_timeframe(requested_timeframe)
+            result['timeframe'] = requested_timeframe
+            result['model_timeframe'] = model_timeframe
+
+            # 1. Resolve model timeframe (fallback if needed)
+            if not model_timeframe:
+                result['error'] = f"No trained model found for timeframe: {requested_timeframe}"
+                return result
+
+            if not self._check_model_exists(model_timeframe):
+                result['error'] = f"No trained model found for timeframe: {requested_timeframe}"
                 return result
             
             result['model_available'] = True
             
-            # 2. Load model if not already loaded
-            if self.model.model is None:
-                logger.info(f"Loading model for timeframe: {timeframe}")
-                # Try to load the latest model for this timeframe
-                if not self.model.load_model():
+            # 2. Load the latest model for the resolved model timeframe
+            model_path = self._get_latest_model_path(model_timeframe)
+            if model_path is None:
+                result['error'] = f"No trained model found for timeframe: {requested_timeframe}"
+                result['model_available'] = False
+                return result
+
+            if self._loaded_model_path != str(model_path) or self.model.model is None:
+                logger.info(f"Loading model for timeframe: {model_timeframe}")
+                if not self.model.load_model(model_path):
                     result['error'] = "Failed to load model"
                     logger.error(result['error'])
                     return result
+                self._loaded_model_path = str(model_path)
+                self._loaded_model_timeframe = model_timeframe
             
             # 3. Prepare features from input data
             logger.debug("Preparing features from input data...")
-            df_features = self._prepare_features_from_data(input_data, timeframe)
+            df_features = self._prepare_features_from_data(input_data, requested_timeframe)
             
             if df_features is None:
                 result['error'] = "Failed to prepare features"
@@ -341,26 +389,42 @@ class SignalGenerator:
             'prediction': None,
             'probability': None,
             'timeframe': timeframe,
+            'model_timeframe': None,
             'model_available': False,
             'error': None
         }
         
         try:
-            # 1. Check if model exists
-            if not self._check_model_exists(timeframe):
-                result['error'] = f"No trained model found for timeframe: {timeframe}"
+            raw_timeframe = str(timeframe or '').strip() or '1d'
+            requested_timeframe = raw_timeframe if (raw_timeframe.endswith('M') and raw_timeframe[:-1].isdigit()) else raw_timeframe.lower()
+            model_timeframe = self.resolve_model_timeframe(requested_timeframe)
+            result['timeframe'] = requested_timeframe
+            result['model_timeframe'] = model_timeframe
+
+            # 1. Resolve model timeframe (fallback if needed)
+            if not model_timeframe or not self._check_model_exists(model_timeframe):
+                result['error'] = f"No trained model found for timeframe: {requested_timeframe}"
                 logger.warning(result['error'])
                 return result
             
             result['model_available'] = True
             
-            # 2. Load model if not already loaded
-            if self.model.model is None:
-                logger.info(f"Loading model for timeframe: {timeframe}")
-                if not self.model.load_model():
+            # 2. Load the latest model for the resolved model timeframe
+            model_path = self._get_latest_model_path(model_timeframe)
+            if model_path is None:
+                result['error'] = f"No trained model found for timeframe: {requested_timeframe}"
+                result['model_available'] = False
+                logger.warning(result['error'])
+                return result
+
+            if self._loaded_model_path != str(model_path) or self.model.model is None:
+                logger.info(f"Loading model for timeframe: {model_timeframe}")
+                if not self.model.load_model(model_path):
                     result['error'] = "Failed to load model"
                     logger.error(result['error'])
                     return result
+                self._loaded_model_path = str(model_path)
+                self._loaded_model_timeframe = model_timeframe
             
             # 3. Ensure features are in correct shape (2D array)
             if input_features.ndim == 1:
@@ -412,8 +476,7 @@ class SignalGenerator:
         Returns:
             List of timeframe strings that have trained models
         """
-        current_file = Path(__file__).resolve()
-        models_dir = current_file.parent / "models"
+        models_dir = self._get_models_dir()
         
         # Find all model files
         model_files = list(models_dir.glob("logistic_regression_*.pkl"))

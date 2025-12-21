@@ -15,22 +15,21 @@ import { toast } from 'sonner';
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 // Dummy performance data (kept for chart, as backend doesn't provide historical performance yet)
-const generatePerformanceData = () => {
-  const data = [];
-  for (let i = 30; i >= 0; i--) {
-    const date = new Date(Date.now() - i * 24 * 60 * 60 * 1000);
-    data.push({
-      date: date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-      accuracy: 75 + Math.random() * 10 + (30 - i) * 0.2,
-      loss: 0.4 - Math.random() * 0.1 - (30 - i) * 0.005
-    });
-  }
-  return data;
+const generatePerformanceData = (accuracyPct = 0) => {
+  const now = new Date();
+  const prev = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const acc = Number.isFinite(accuracyPct) ? accuracyPct : 0;
+  const loss = Math.max(0, Math.min(1, 1 - acc / 100));
+  return [
+    { date: prev.toISOString(), accuracy: Math.max(0, Math.min(100, acc)), loss },
+    { date: now.toISOString(), accuracy: Math.max(0, Math.min(100, acc)), loss },
+  ];
 };
 
 const ModelDashboard = () => {
   const [models, setModels] = useState<MLModel[]>([]);
   const [loading, setLoading] = useState(true);
+  const [performanceData, setPerformanceData] = useState<Array<{ date: string; accuracy: number; loss: number }>>([]);
   const [onlineLearning, setOnlineLearning] = useState(false);
   const [autoRetrain, setAutoRetrain] = useState(false);
   const [resumeFromState, setResumeFromState] = useState(true);
@@ -49,7 +48,7 @@ const ModelDashboard = () => {
           throw new Error('Failed to fetch model status');
         }
         const data = await response.json();
-        
+
         // Fetch feature importance (weights) if model exists
         let featureImportance: { feature: string; weight: number }[] = [];
         if (data.model_exists) {
@@ -66,94 +65,57 @@ const ModelDashboard = () => {
             }
           } catch (error) {
             console.warn('Failed to fetch feature weights:', error);
-            // Fallback to feature names only
-            featureImportance = data.model_info?.feature_names?.slice(0, 6).map((name: string, index: number) => ({
-              feature: name.replace(/_/g, ' ').replace(/\b\w/g, (l: string) => l.toUpperCase()),
-              weight: 0.2 - (index * 0.02)
-            })) || [];
+            featureImportance = [];
           }
         }
-        
+
         // Convert API response to MLModel format
         const logisticRegressionModel: MLModel = {
           id: 'model-lr',
           name: 'Logistic Regression',
           type: 'logistic_regression',
           accuracy: data.current_accuracy ? data.current_accuracy * 100 : 0, // Convert to percentage
-          lastTrained: data.model_info?.last_trained 
-            ? new Date(data.model_info.last_trained) 
-            : new Date(),
+          lastTrained: data.model_info?.last_trained
+            ? new Date(data.model_info.last_trained)
+            : null,
           datasetSize: data.model_info?.sample_size || 0,
           isActive: data.model_exists || false,
           status: data.model_exists ? 'ready' : 'error',
-          featureImportance: featureImportance.length > 0 ? featureImportance : [
-            { feature: 'No features available', weight: 0 }
-          ]
+          featureImportance: featureImportance
         };
-        
-        // Keep other models as placeholders for now (only logistic regression is implemented)
-        const otherModels: MLModel[] = [
-          {
-            id: 'model-rf',
-            name: 'Random Forest',
-            type: 'random_forest',
-            accuracy: 0,
-            lastTrained: new Date(),
-            datasetSize: 0,
-            isActive: false,
-            status: 'error',
-            featureImportance: []
-          },
-          {
-            id: 'model-lstm',
-            name: 'LSTM Network',
-            type: 'lstm',
-            accuracy: 0,
-            lastTrained: new Date(),
-            datasetSize: 0,
-            isActive: false,
-            status: 'error',
-            featureImportance: []
-          },
-          {
-            id: 'model-ensemble',
-            name: 'Ensemble Model',
-            type: 'ensemble',
-            accuracy: 0,
-            lastTrained: new Date(),
-            datasetSize: 0,
-            isActive: false,
-            status: 'error',
-            featureImportance: []
-          }
-        ];
-        
-        setModels([logisticRegressionModel, ...otherModels]);
+
+        setModels(data.model_exists ? [logisticRegressionModel] : []);
         setOnlineLearning(data.online_learning_enabled || false);
         setAutoRetrain(data.auto_retrain_enabled || false);
+
+        try {
+          const perfRes = await fetch(`${API_BASE_URL}/api/ml/performance`);
+          if (perfRes.ok) {
+            const perf = await perfRes.json();
+            const arr = Array.isArray(perf?.performance) ? perf.performance : [];
+            setPerformanceData(arr.length ? arr : generatePerformanceData(logisticRegressionModel.accuracy));
+          } else {
+            setPerformanceData(generatePerformanceData(logisticRegressionModel.accuracy));
+          }
+        } catch (e) {
+          setPerformanceData(generatePerformanceData(logisticRegressionModel.accuracy));
+        }
       } catch (error) {
         console.error('Error fetching model data:', error);
         toast.error('Failed to load model data');
         // Fallback to empty models
         setModels([]);
+        setPerformanceData(generatePerformanceData(0));
       } finally {
         setLoading(false);
       }
     };
-    
+
     fetchModelData();
-    // Refresh every 30 seconds
-    const interval = setInterval(fetchModelData, 30000);
-    return () => clearInterval(interval);
   }, [retrainKey]);
 
   const activeModel = models.find(m => m.isActive);
-  
-  // Regenerate performance data when active model changes or is retrained
-  const performanceData = useMemo(() => {
-    return generatePerformanceData();
-  }, [activeModel?.id, activeModel?.lastTrained, retrainKey]);
-  
+
   const featureData = useMemo(() => {
     return activeModel?.featureImportance.map(f => ({
       feature: f.feature,
@@ -173,18 +135,18 @@ const ModelDashboard = () => {
   const handleRetrain = async (id: string) => {
     const model = models.find(m => m.id === id);
     if (!model) return;
-    
+
     // Only logistic regression is implemented
     if (id !== 'model-lr') {
       toast.error('Only Logistic Regression model is currently available for retraining');
       return;
     }
-    
-    setModels(prev => prev.map(m => 
+
+    setModels(prev => prev.map(m =>
       m.id === id ? { ...m, status: 'training' as const } : m
     ));
     toast.info(`Retraining ${model.name}...`, { description: 'This may take a few minutes' });
-    
+
     try {
       const response = await fetch(`${API_BASE_URL}/api/ml/retrain`, {
         method: 'POST',
@@ -196,13 +158,13 @@ const ModelDashboard = () => {
           force: true
         })
       });
-      
+
       if (!response.ok) {
         throw new Error('Retraining failed');
       }
-      
+
       const result = await response.json();
-      
+
       if (result.status === 'success') {
         // Refresh model data
         setRetrainKey(prev => prev + 1);
@@ -214,7 +176,7 @@ const ModelDashboard = () => {
       }
     } catch (error) {
       console.error('Retraining error:', error);
-      setModels(prev => prev.map(m => 
+      setModels(prev => prev.map(m =>
         m.id === id ? { ...m, status: 'error' as const } : m
       ));
       toast.error(`Failed to retrain ${model.name}`);
@@ -224,14 +186,14 @@ const ModelDashboard = () => {
   const handleRetrainAll = async () => {
     toast.info('Retraining all models...', { description: 'This will update all models with latest data' });
     setModels(prev => prev.map(m => ({ ...m, status: 'training' as const })));
-    
+
     try {
       // Only retrain logistic regression (only implemented model)
       const lrModel = models.find(m => m.id === 'model-lr');
       if (lrModel) {
         await handleRetrain('model-lr');
       }
-      
+
       // Refresh all model data
       setRetrainKey(prev => prev + 1);
       toast.success('Model retraining initiated!');
@@ -244,8 +206,8 @@ const ModelDashboard = () => {
 
   // Summary stats (only count models with data)
   const activeModels = models.filter(m => m.status === 'ready' && m.accuracy > 0);
-  const avgAccuracy = activeModels.length > 0 
-    ? activeModels.reduce((sum, m) => sum + m.accuracy, 0) / activeModels.length 
+  const avgAccuracy = activeModels.length > 0
+    ? activeModels.reduce((sum, m) => sum + m.accuracy, 0) / activeModels.length
     : 0;
   const totalDataset = models.find(m => m.id === 'model-lr')?.datasetSize || 0;
 
@@ -340,9 +302,15 @@ const ModelDashboard = () => {
         <div className="lg:col-span-2 space-y-4">
           <h2 className="text-xl font-semibold text-foreground">Available Models</h2>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {models.map(model => (
+            {models.length === 0 ? (
+              <Card>
+                <CardContent className="pt-6">
+                  <p className="text-sm text-muted-foreground">No trained model found.</p>
+                </CardContent>
+              </Card>
+            ) : models.map(model => (
               <ModelCard
-                key={`${model.id}-${model.lastTrained.getTime()}-${model.accuracy}-${retrainKey}`}
+                key={`${model.id}-${model.lastTrained ? model.lastTrained.getTime() : 'none'}-${model.accuracy}-${retrainKey}`}
                 model={model}
                 onSelect={handleSelectModel}
                 onRetrain={handleRetrain}
@@ -376,7 +344,8 @@ const ModelDashboard = () => {
                 <Switch
                   id="online-learning"
                   checked={onlineLearning}
-                  onCheckedChange={setOnlineLearning}
+                  onCheckedChange={() => toast.info('Online learning toggle is read-only (configure server-side).')}
+                  disabled
                 />
               </div>
 
@@ -482,9 +451,9 @@ const ModelDashboard = () => {
                   id="auto-retrain"
                   checked={autoRetrain}
                   onCheckedChange={(checked) => {
-                    setAutoRetrain(checked);
-                    toast.info(checked ? 'Auto retraining enabled' : 'Auto retraining disabled');
+                    toast.info('Auto retrain toggle is read-only (configure server-side).');
                   }}
+                  disabled
                 />
               </div>
 
@@ -495,7 +464,7 @@ const ModelDashboard = () => {
                   <span className="text-muted-foreground">Last Checkpoint</span>
                 </div>
                 <p className="text-sm font-medium">
-                  {new Date(Date.now() - 2 * 60 * 60 * 1000).toLocaleString()}
+                  {activeModel?.lastTrained ? activeModel.lastTrained.toLocaleString() : '--'}
                 </p>
                 <p className="text-xs text-muted-foreground">
                   All models saved • {(totalDataset / 1000).toFixed(0)}k samples processed

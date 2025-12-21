@@ -4,6 +4,10 @@ from typing import List, Optional, Dict
 from pydantic import BaseModel, Field
 from app.services.indicators import indicators_service
 from app.utils.logging import get_logger
+import pandas as pd
+
+from app.services import get_mt5_client
+from app.services.mock_mt5 import MockMT5Client
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/indicators", tags=["indicators"])
@@ -36,6 +40,252 @@ class IndicatorsRequest(BaseModel):
                 }
             }
         }
+
+
+@router.get("/ohlcv")
+async def get_ohlcv(
+    symbol: str = Query(..., description="Trading symbol"),
+    timeframe: str = Query("1d", description="Timeframe (e.g., 1m,5m,1h,1d)"),
+    limit: int = Query(200, ge=1, le=10000, description="Maximum number of bars")
+):
+    """Get OHLCV data for charts (real data only).
+
+    Preference order:
+    1) Real MT5 connection (returns latest bars)
+    2) Database OHLCV table
+    """
+    try:
+        symbol = symbol.strip().upper()
+        timeframe = timeframe.strip()
+
+        def _parse_requested_timeframe(tf: str) -> Dict[str, object]:
+            tf = str(tf or '').strip()
+            if not tf:
+                return {"raw": "1d", "kind": "day", "n": 1}
+
+            # Months are expressed in the UI as '1M', '3M', ... (uppercase M)
+            if tf.endswith('M') and tf[:-1].isdigit():
+                return {"raw": tf, "kind": "month", "n": int(tf[:-1])}
+
+            low = tf.lower()
+            if low.endswith('m') and low[:-1].isdigit():
+                return {"raw": low, "kind": "minute", "n": int(low[:-1])}
+            if low.endswith('h') and low[:-1].isdigit():
+                return {"raw": low, "kind": "hour", "n": int(low[:-1])}
+            if low.endswith('d') and low[:-1].isdigit():
+                return {"raw": low, "kind": "day", "n": int(low[:-1])}
+            if low.endswith('w') and low[:-1].isdigit():
+                return {"raw": low, "kind": "week", "n": int(low[:-1])}
+
+            return {"raw": low, "kind": "day", "n": 1}
+
+        def _pick_mt5_base_tf(parsed: Dict[str, object]) -> Dict[str, object]:
+            kind = parsed["kind"]
+            n = int(parsed["n"])  # type: ignore[arg-type]
+
+            # Supported by our MT5 client wrapper
+            if kind == 'month':
+                # Use D1 + resample for months to avoid extremely long MN1 lookbacks.
+                # This keeps the endpoint responsive and prevents empty responses.
+                return {"mt5_tf": "D1", "mult": max(1, n * 30), "resample": f"{n}MS"}
+
+            if kind == 'minute':
+                if n in (1, 5, 15, 30):
+                    return {"mt5_tf": f"M{n}", "mult": 1, "resample": None}
+                if n == 45:
+                    return {"mt5_tf": "M15", "mult": 3, "resample": "45min"}
+                # Generic minute aggregation
+                return {"mt5_tf": "M1", "mult": n, "resample": f"{n}min"}
+
+            if kind == 'hour':
+                if n == 4:
+                    return {"mt5_tf": "H4", "mult": 1, "resample": None}
+                return {"mt5_tf": "H1", "mult": n, "resample": f"{n}H"}
+
+            if kind == 'week':
+                return {"mt5_tf": "W1", "mult": n, "resample": f"{n}W"}
+
+            # day (default)
+            return {"mt5_tf": "D1", "mult": n, "resample": f"{n}D" if n != 1 else None}
+
+        def _resample_ohlcv(df: 'pd.DataFrame', rule: str) -> 'pd.DataFrame':
+            if df is None or df.empty:
+                return df
+            if 'timestamp' not in df.columns:
+                return df
+
+            tmp = df.copy()
+            tmp = tmp.sort_values('timestamp')
+            tmp = tmp.set_index('timestamp')
+
+            agg = tmp.resample(rule).agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum',
+            })
+
+            agg = agg.dropna(subset=['open', 'high', 'low', 'close']).reset_index()
+            return agg
+
+        # Try MT5 first if real connected
+        mt5_client = get_mt5_client()
+        if mt5_client.is_connected and not isinstance(mt5_client, MockMT5Client):
+            parsed = _parse_requested_timeframe(timeframe)
+            base = _pick_mt5_base_tf(parsed)
+            mt5_tf = str(base['mt5_tf'])
+            mult = int(base['mult'])
+            resample_rule = base.get('resample')
+
+            from datetime import datetime, timedelta
+            end = datetime.utcnow()
+            max_lookback = timedelta(days=3650)
+            # Approximate window for requested limit (fetch enough base bars if we need aggregation)
+            base_limit = max(1, int(limit) * max(1, mult) + 10)
+            if mt5_tf.startswith('M'):
+                minutes = int(mt5_tf[1:]) if len(mt5_tf) > 1 else 1
+                start = end - timedelta(minutes=minutes * base_limit)
+            elif mt5_tf.startswith('H'):
+                hours = int(mt5_tf[1:]) if len(mt5_tf) > 1 else 1
+                start = end - timedelta(hours=hours * base_limit)
+            elif mt5_tf == 'D1':
+                start = end - timedelta(days=base_limit)
+            elif mt5_tf == 'W1':
+                start = end - timedelta(weeks=base_limit)
+            elif mt5_tf == 'MN1':
+                start = end - timedelta(days=30 * base_limit)
+            else:
+                start = end - timedelta(days=base_limit)
+
+            # Prevent massive lookbacks (e.g., 12M with limit=200 -> ~200 years).
+            if start < end - max_lookback:
+                start = end - max_lookback
+
+            df = mt5_client.get_ohlcv(symbol, mt5_tf, start=start, end=end)
+            if df is not None and not df.empty:
+                if resample_rule:
+                    df = _resample_ohlcv(df, str(resample_rule))
+                df = df.tail(limit)
+                return {
+                    'symbol': symbol,
+                    'timeframe': timeframe,
+                    'source': 'mt5',
+                    'count': int(len(df)),
+                    'ohlcv': [
+                        {
+                            'timestamp': row['timestamp'].isoformat() if hasattr(row['timestamp'], 'isoformat') else str(row['timestamp']),
+                            'open': float(row['open']),
+                            'high': float(row['high']),
+                            'low': float(row['low']),
+                            'close': float(row['close']),
+                            'volume': float(row['volume']),
+                        }
+                        for _, row in df.iterrows()
+                    ],
+                }
+
+        # Fallback: database
+        parsed = _parse_requested_timeframe(timeframe)
+        kind = str(parsed.get('kind') or 'day')
+        n = int(parsed.get('n') or 1)
+
+        # DB OHLCV data is often daily (scraped). Resampling only makes sense when
+        # the requested timeframe is COARSER than the DB resolution.
+        resample_rule = None
+        if kind == 'week':
+            resample_rule = f"{n}W"
+            base_limit = int(limit) * max(1, 7 * n) + 10
+        elif kind == 'month':
+            resample_rule = f"{n}MS"
+            base_limit = int(limit) * max(1, 31 * n) + 10
+        elif kind == 'day' and n > 1:
+            resample_rule = f"{n}D"
+            base_limit = int(limit) * n + 10
+        else:
+            base_limit = int(limit) + 10
+
+        df = await indicators_service.get_ohlcv_data(symbol, limit=base_limit)
+        if df.empty:
+            return {
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'source': 'database',
+                'count': 0,
+                'ohlcv': [],
+            }
+
+        effective_timeframe = timeframe
+        note: Optional[str] = None
+
+        try:
+            if len(df) >= 3 and 'timestamp' in df.columns:
+                diffs = (
+                    pd.to_datetime(df['timestamp'], utc=True, errors='coerce')
+                    .sort_values()
+                    .diff()
+                    .dropna()
+                )
+                if not diffs.empty:
+                    base_seconds = float(diffs.dt.total_seconds().median())
+                    req_seconds = 86400.0
+                    if kind == 'minute':
+                        req_seconds = float(max(1, n) * 60)
+                    elif kind == 'hour':
+                        req_seconds = float(max(1, n) * 3600)
+                    elif kind == 'day':
+                        req_seconds = float(max(1, n) * 86400)
+                    elif kind == 'week':
+                        req_seconds = float(max(1, n) * 7 * 86400)
+                    elif kind == 'month':
+                        req_seconds = float(max(1, n) * 30 * 86400)
+
+                    # If requested timeframe is FINER than DB resolution, don't resample.
+                    # Returning DB data avoids empty charts.
+                    if req_seconds < base_seconds:
+                        resample_rule = None
+                        effective_timeframe = '1d' if base_seconds >= 86400 else timeframe
+                        note = (
+                            f"Database OHLCV resolution (~{int(base_seconds)}s) is coarser than requested "
+                            f"timeframe (~{int(req_seconds)}s). Returning base data without resampling."
+                        )
+        except Exception:
+            # Keep endpoint resilient; fallback continues without note.
+            pass
+
+        if resample_rule:
+            df = _resample_ohlcv(df, str(resample_rule))
+        df = df.tail(limit)
+
+        return {
+            'symbol': symbol,
+            'timeframe': timeframe,
+            'effective_timeframe': effective_timeframe,
+            'source': 'database',
+            'count': int(len(df)),
+            'note': note,
+            'ohlcv': [
+                {
+                    'timestamp': ts.isoformat() if hasattr(ts, 'isoformat') else str(ts),
+                    'open': float(o),
+                    'high': float(h),
+                    'low': float(l),
+                    'close': float(c),
+                    'volume': float(v),
+                }
+                for ts, o, h, l, c, v in zip(
+                    df['timestamp'].tolist(),
+                    df['open'].tolist(),
+                    df['high'].tolist(),
+                    df['low'].tolist(),
+                    df['close'].tolist(),
+                    df['volume'].tolist(),
+                )
+            ],
+        }
+    except Exception as e:
+        logger.error(f"Failed to fetch OHLCV for {symbol}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch OHLCV: {str(e)}")
 
 
 @router.post("/calculate")

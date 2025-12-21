@@ -6,7 +6,6 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { RotateCcw, Filter } from 'lucide-react';
 
 export interface TradeFilters {
-  tradeType: string;
   side: string;
   profitLoss: string;
   status: string;
@@ -35,22 +34,6 @@ export const TradeHistoryFilters = ({ filters, onFilterChange, onReset }: TradeH
         </div>
         
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7">
-          {/* Trade Type */}
-          <div className="space-y-1.5">
-            <Label className="text-xs">Trade Type</Label>
-            <Select value={filters.tradeType} onValueChange={(v) => updateFilter('tradeType', v)}>
-              <SelectTrigger className="h-9">
-                <SelectValue placeholder="All" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All Types</SelectItem>
-                <SelectItem value="market">Market</SelectItem>
-                <SelectItem value="limit">Limit</SelectItem>
-                <SelectItem value="stop">Stop</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-
           {/* Side */}
           <div className="space-y-1.5">
             <Label className="text-xs">Side</Label>
@@ -90,8 +73,9 @@ export const TradeHistoryFilters = ({ filters, onFilterChange, onReset }: TradeH
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">All</SelectItem>
-                <SelectItem value="completed">Closed</SelectItem>
-                <SelectItem value="pending">Open</SelectItem>
+                <SelectItem value="completed">Completed</SelectItem>
+                <SelectItem value="pending">Pending</SelectItem>
+                <SelectItem value="cancelled">Cancelled</SelectItem>
               </SelectContent>
             </Select>
           </div>

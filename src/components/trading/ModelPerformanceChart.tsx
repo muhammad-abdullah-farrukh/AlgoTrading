@@ -72,7 +72,7 @@ export const ModelPerformanceChart = ({ performanceData, featureData, modelName 
                     dataKey="accuracy"
                     stroke="hsl(var(--primary))"
                     strokeWidth={2}
-                    dot={false}
+                    dot={performanceData.length < 2}
                     name="Accuracy (%)"
                   />
                   <Line
@@ -81,7 +81,7 @@ export const ModelPerformanceChart = ({ performanceData, featureData, modelName 
                     dataKey="loss"
                     stroke="hsl(var(--destructive))"
                     strokeWidth={2}
-                    dot={false}
+                    dot={performanceData.length < 2}
                     name="Loss"
                   />
                 </LineChart>

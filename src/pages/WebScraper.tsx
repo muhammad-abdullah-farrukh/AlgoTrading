@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -24,6 +24,7 @@ import {
 import { Globe, Download, Play, Database, Plus, Loader2, CheckCircle, Clock, FileSpreadsheet, Brain, Layers } from 'lucide-react';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
+import api from '@/utils/api';
 
 // Data sources configuration
 interface DataSource {
@@ -41,59 +42,8 @@ const DATA_SOURCES: DataSource[] = [
 ];
 
 // Dummy scraped data
-const generateDummyScrapedData = (symbol: string) => {
-  const data = [];
-  for (let i = 0; i < 50; i++) {
-    const date = new Date(Date.now() - i * 24 * 60 * 60 * 1000);
-    const basePrice = symbol === 'EURUSD' ? 1.08 : symbol === 'BTCUSDT' ? 43000 : 185;
-    const variation = symbol === 'EURUSD' ? 0.02 : symbol === 'BTCUSDT' ? 2000 : 10;
-    data.push({
-      date: date.toISOString().split('T')[0],
-      open: (basePrice + (Math.random() - 0.5) * variation).toFixed(symbol === 'EURUSD' ? 5 : 2),
-      high: (basePrice + Math.random() * variation).toFixed(symbol === 'EURUSD' ? 5 : 2),
-      low: (basePrice - Math.random() * variation).toFixed(symbol === 'EURUSD' ? 5 : 2),
-      close: (basePrice + (Math.random() - 0.5) * variation).toFixed(symbol === 'EURUSD' ? 5 : 2),
-      volume: Math.floor(Math.random() * 1000000) + 100000,
-    });
-  }
-  return data;
-};
 
 // Dummy AI Model data
-const aiModels = [
-  {
-    id: 'lr',
-    name: 'Logistic Regression',
-    weights: 'lr_weights_v2.pkl',
-    metadata: '{ features: 12, regularization: L2 }',
-    lastTrained: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000),
-    accuracy: 72.5,
-  },
-  {
-    id: 'rf',
-    name: 'Random Forest',
-    weights: 'rf_weights_v3.pkl',
-    metadata: '{ n_estimators: 100, max_depth: 15 }',
-    lastTrained: new Date(Date.now() - 1 * 24 * 60 * 60 * 1000),
-    accuracy: 78.3,
-  },
-  {
-    id: 'lstm',
-    name: 'LSTM Network',
-    weights: 'lstm_weights_v1.h5',
-    metadata: '{ layers: 3, units: 128, dropout: 0.2 }',
-    lastTrained: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000),
-    accuracy: 81.7,
-  },
-  {
-    id: 'ensemble',
-    name: 'Ensemble Model',
-    weights: 'ensemble_weights_v2.pkl',
-    metadata: '{ models: [LR, RF, LSTM], voting: soft }',
-    lastTrained: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000),
-    accuracy: 84.2,
-  },
-];
 
 const symbols = [
   { value: 'EURUSD', label: 'EUR/USD', type: 'Forex' },
@@ -107,12 +57,91 @@ const WebScraper = () => {
   const [scrapedData, setScrapedData] = useState<any[]>([]);
   const [liveAppendEnabled, setLiveAppendEnabled] = useState(false);
   const [lastScrapeTime, setLastScrapeTime] = useState<Date | null>(null);
-  const [scrapeHistory, setScrapeHistory] = useState([
-    { symbol: 'EURUSD', date: new Date(Date.now() - 2 * 60 * 60 * 1000), rows: 1250 },
-    { symbol: 'BTCUSDT', date: new Date(Date.now() - 24 * 60 * 60 * 1000), rows: 890 },
-  ]);
+  const [scrapeHistory, setScrapeHistory] = useState<Array<{ symbol: string; date: Date; rows: number }>>([]);
   const [selectedSources, setSelectedSources] = useState<Set<string>>(new Set(['yahoo']));
   const [customSourceUrl, setCustomSourceUrl] = useState('');
+  const [mlStatus, setMlStatus] = useState<any | null>(null);
+  const [datasetStats, setDatasetStats] = useState<any | null>(null);
+
+  const refreshDatasetStats = async () => {
+    try {
+      const stats = await api.get<any>('/api/integrity/stats');
+      setDatasetStats(stats);
+      const history = (stats?.metadata || [])
+        .map((m: any) => ({
+          symbol: String(m.symbol),
+          date: new Date(m.updated_at || m.end_date || Date.now()),
+          rows: Number(m.row_count || 0),
+        }))
+        .sort((a: any, b: any) => b.date.getTime() - a.date.getTime())
+        .slice(0, 5);
+      setScrapeHistory(history);
+    } catch (e) {
+      console.error('[WebScraper] Failed to load dataset stats:', e);
+    }
+  };
+
+  const handleFlushLiveTrades = async () => {
+    try {
+      const res = await api.post<any>('/api/trade/live-trades/flush');
+      toast.success('Live trades flushed', {
+        description: res?.message || `Rows flushed: ${res?.rows_flushed ?? 0}`
+      });
+    } catch (error) {
+      console.error('Flush live trades error:', error);
+      const detail =
+        (error as any)?.response?.data?.detail ||
+        (error as any)?.response?.data?.message ||
+        (error as any)?.message ||
+        'Failed to flush live trades';
+      toast.error('Flush failed', { description: `${String(detail)} (API: ${api.baseURL})` });
+    }
+  };
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const status = await api.get<any>('/api/ml/status');
+        setMlStatus(status);
+      } catch (e) {
+        console.error('[WebScraper] Failed to load ML status:', e);
+      }
+      await refreshDatasetStats();
+    })();
+  }, []);
+
+  const modelRows = useMemo(() => {
+    if (!mlStatus || !mlStatus.model_exists || !mlStatus.model_info) return [];
+    const info = mlStatus.model_info;
+    const lastTrained = info?.last_trained ? new Date(info.last_trained) : null;
+    const accuracy = mlStatus.current_accuracy !== null && mlStatus.current_accuracy !== undefined
+      ? Number(mlStatus.current_accuracy) * 100
+      : null;
+    return [
+      {
+        id: 'lr',
+        name: 'Logistic Regression',
+        weights: 'logistic_regression.pkl',
+        metadata: JSON.stringify({
+          timeframe: info?.timeframe,
+          feature_count: info?.feature_count,
+          sample_size: info?.sample_size,
+        }),
+        lastTrained,
+        accuracy,
+      },
+    ];
+  }, [mlStatus]);
+
+  const selectedSymbolStats = useMemo(() => {
+    const meta = (datasetStats?.metadata || []).find((m: any) => String(m.symbol) === String(selectedSymbol));
+    return {
+      rows: Number(meta?.row_count || 0),
+      updatedAt: meta?.updated_at ? new Date(meta.updated_at) : null,
+      startDate: meta?.start_date ? new Date(meta.start_date) : null,
+      endDate: meta?.end_date ? new Date(meta.end_date) : null,
+    };
+  }, [datasetStats, selectedSymbol]);
 
   const toggleSource = (sourceId: string) => {
     setSelectedSources(prev => {
@@ -131,25 +160,77 @@ const WebScraper = () => {
       toast.error('Please select at least one data source');
       return;
     }
-    
+
     setIsScraping(true);
-    const sourceNames = Array.from(selectedSources).map(id => 
+    const sourceNames = Array.from(selectedSources).map(id =>
       DATA_SOURCES.find(s => s.id === id)?.name || id
     ).join(', ');
     toast.info(`Scraping data from ${sourceNames}...`, { description: 'This may take a moment' });
 
-    // Simulate scraping delay
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    // Call backend API to scrape data
+    try {
+      await api.post('/api/scrape/start', {
+        symbol: selectedSymbol,
+        sources: Array.from(selectedSources),
+        source_params: {}
+      });
 
-    const data = generateDummyScrapedData(selectedSymbol);
-    setScrapedData(data);
-    setLastScrapeTime(new Date());
-    setScrapeHistory(prev => [
-      { symbol: selectedSymbol, date: new Date(), rows: data.length },
-      ...prev.slice(0, 4),
-    ]);
-    setIsScraping(false);
-    toast.success(`Successfully scraped ${data.length} rows for ${selectedSymbol}`);
+      // Wait for scraping to complete (poll status)
+      await new Promise(resolve => setTimeout(resolve, 3000));
+
+      // Fetch scraped data status
+      const statusData = await api.get<any>(`/api/scrape/status/${selectedSymbol}`);
+
+      // Fetch actual OHLCV data
+      try {
+        const ohlcvData = await api.get<any>('/api/indicators/ohlcv', {
+          params: {
+            symbol: selectedSymbol,
+            timeframe: '1d',
+            limit: 100
+          }
+        });
+        if (ohlcvData && ohlcvData.ohlcv && ohlcvData.ohlcv.length > 0) {
+          const formattedData = ohlcvData.ohlcv.map((d: any) => ({
+            date: new Date(d.timestamp).toISOString().split('T')[0],
+            open: d.open.toFixed(5),
+            high: d.high.toFixed(5),
+            low: d.low.toFixed(5),
+            close: d.close.toFixed(5),
+            volume: d.volume
+          }));
+
+          setScrapedData(formattedData.slice(0, 50)); // Show first 50 rows in preview
+          setLastScrapeTime(new Date());
+          await refreshDatasetStats();
+
+          toast.success(`Successfully scraped ${statusData.total_rows || formattedData.length} rows for ${selectedSymbol}`, {
+            description: `Showing first 50 rows. Total: ${statusData.total_rows || formattedData.length}`
+          });
+        } else {
+          toast.info(`Scraping initiated for ${selectedSymbol}`, {
+            description: `Total rows in database: ${statusData.total_rows || 0}`
+          });
+        }
+      } catch (ohlcvError) {
+        console.error('OHLCV fetch error:', ohlcvError);
+        toast.info(`Scraping completed for ${selectedSymbol}`, {
+          description: `Total rows: ${statusData.total_rows || 0}`
+        });
+      }
+    } catch (error) {
+      console.error('Scraping error:', error);
+      const detail =
+        (error as any)?.response?.data?.detail ||
+        (error as any)?.response?.data?.message ||
+        (error as any)?.message ||
+        'Could not connect to backend or fetch data';
+      toast.error('Scraping failed', {
+        description: `${String(detail)} (API: ${api.baseURL})`
+      });
+    } finally {
+      setIsScraping(false);
+    }
   };
 
   const handleDownloadCSV = () => {
@@ -161,7 +242,7 @@ const WebScraper = () => {
     const headers = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume'];
     const csvContent = [
       headers.join(','),
-      ...scrapedData.map(row => 
+      ...scrapedData.map(row =>
         [row.date, row.open, row.high, row.low, row.close, row.volume].join(',')
       ),
     ].join('\n');
@@ -174,38 +255,63 @@ const WebScraper = () => {
     toast.success('CSV file downloaded successfully');
   };
 
-  const handleDownloadModelCSV = () => {
-    const headers = ['Model Name', 'Weights File', 'Metadata', 'Last Trained', 'Accuracy'];
-    const csvContent = [
-      headers.join(','),
-      ...aiModels.map(model => 
-        [
-          model.name,
-          model.weights,
-          `"${model.metadata}"`,
-          model.lastTrained.toISOString(),
-          `${model.accuracy}%`
-        ].join(',')
-      ),
-    ].join('\n');
+  const handleDownloadModelCSV = async () => {
+    try {
+      // Call backend to export real model data
+      const result = await api.post<any>('/api/ml/export');
 
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = `ai_models_data_${new Date().toISOString().split('T')[0]}.csv`;
-    link.click();
-    toast.success('AI Model data exported successfully');
+      toast.success('Model data exported successfully', {
+        description: `Real model weights and metadata saved to Pipeline folder`
+      });
+    } catch (error) {
+      console.error('Export error:', error);
+      toast.error('Model export failed', {
+        description: 'Ensure model is trained first. Run: python train_model.py 1d'
+      });
+    }
   };
 
-  const handleAppendLiveData = () => {
-    if (scrapedData.length === 0) {
-      toast.error('No scraped data to append to. Run a scrape first.');
-      return;
+  const handleDownloadModelXLSX = async () => {
+    try {
+      const response = await fetch(`${api.baseURL}/api/ml/export/xlsx`);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || `Export failed: ${response.status}`);
+      }
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `ai-model-export.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+      toast.success('Excel file downloaded successfully');
+    } catch (error) {
+      console.error('XLSX export error:', error);
+      toast.error('Excel export failed', {
+        description: (error as any)?.message || 'Failed to export Excel file'
+      });
     }
-    
-    toast.success('Live MT5/Mock data appended to dataset', {
-      description: `Added ${Math.floor(Math.random() * 50) + 10} new rows`,
-    });
+  };
+
+  const handleAppendLiveData = async () => {
+    try {
+      const res = await api.post<any>(`/api/scrape/append-live/${selectedSymbol}`);
+      toast.success('Live data append finished', {
+        description: res?.message || `Rows appended: ${res?.rows_appended ?? 0}`
+      });
+      await refreshDatasetStats();
+    } catch (error) {
+      console.error('Append live data error:', error);
+      const detail =
+        (error as any)?.response?.data?.detail ||
+        (error as any)?.response?.data?.message ||
+        (error as any)?.message ||
+        'Failed to append live data';
+      toast.error('Append live data failed', { description: String(detail) });
+    }
   };
 
   return (
@@ -250,8 +356,8 @@ const WebScraper = () => {
                 onClick={() => source.id !== 'custom' && toggleSource(source.id)}
                 className={cn(
                   "p-4 rounded-lg border cursor-pointer transition-all duration-200",
-                  selectedSources.has(source.id) 
-                    ? "bg-ai-purple/10 border-ai-purple/30" 
+                  selectedSources.has(source.id)
+                    ? "bg-ai-purple/10 border-ai-purple/30"
                     : "bg-muted/30 border-border hover:bg-muted/50"
                 )}
               >
@@ -377,7 +483,7 @@ const WebScraper = () => {
               <Plus className="h-5 w-5" />
               Live Data Append
             </CardTitle>
-            <CardDescription>Append real-time MT5/mock data to datasets</CardDescription>
+            <CardDescription>Append recent OHLCV bars from MT5 into the dataset</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="flex items-center justify-between">
@@ -386,7 +492,7 @@ const WebScraper = () => {
                   Auto Append
                 </Label>
                 <p className="text-xs text-muted-foreground">
-                  Continuously add live data
+                  Not available (no backend scheduler)
                 </p>
               </div>
               <Switch
@@ -394,11 +500,12 @@ const WebScraper = () => {
                 checked={liveAppendEnabled}
                 onCheckedChange={(checked) => {
                   setLiveAppendEnabled(checked);
-                  toast.info(checked ? 'Live append enabled' : 'Live append disabled');
+                  toast.info('Auto append is disabled. Use "Append Live Data Now".');
                 }}
+                disabled
               />
             </div>
-            
+
             <Button
               variant="secondary"
               className="w-full btn-hover"
@@ -408,12 +515,21 @@ const WebScraper = () => {
               Append Live Data Now
             </Button>
 
+            <Button
+              variant="outline"
+              className="w-full btn-hover"
+              onClick={handleFlushLiveTrades}
+            >
+              <Database className="h-4 w-4 mr-2" />
+              Flush Live Trades to Queue
+            </Button>
+
             <div className="p-3 bg-muted/50 rounded-lg">
               <p className="text-xs text-muted-foreground">
-                Data Source: {liveAppendEnabled ? 'MT5 Live Feed' : 'Mock Data Generator'}
+                Dataset rows (selected symbol): {selectedSymbolStats.rows}
               </p>
               <p className="text-xs text-muted-foreground mt-1">
-                Append Interval: Every 5 minutes
+                Last metadata update: {selectedSymbolStats.updatedAt ? selectedSymbolStats.updatedAt.toLocaleString() : '--'}
               </p>
             </div>
           </CardContent>
@@ -431,10 +547,16 @@ const WebScraper = () => {
               </CardTitle>
               <CardDescription>Export model weights and metadata for all AI models</CardDescription>
             </div>
-            <Button onClick={handleDownloadModelCSV} className="btn-glow bg-ai-purple hover:bg-ai-purple/90">
-              <Download className="h-4 w-4 mr-2" />
-              Export All Models CSV
-            </Button>
+            <div className="flex gap-2 flex-wrap">
+              <Button onClick={handleDownloadModelCSV} className="btn-glow bg-ai-purple hover:bg-ai-purple/90">
+                <Download className="h-4 w-4 mr-2" />
+                Export All Models CSV
+              </Button>
+              <Button variant="outline" onClick={handleDownloadModelXLSX} className="btn-hover">
+                <Download className="h-4 w-4 mr-2" />
+                Download Excel (.xlsx)
+              </Button>
+            </div>
           </div>
         </CardHeader>
         <CardContent>
@@ -450,7 +572,13 @@ const WebScraper = () => {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {aiModels.map((model) => (
+                {modelRows.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={5} className="text-muted-foreground">
+                      No trained model found. Train a model first (e.g., run: python train_model.py 1d).
+                    </TableCell>
+                  </TableRow>
+                ) : modelRows.map((model) => (
                   <TableRow key={model.id} className="table-row-hover">
                     <TableCell className="font-medium">
                       <div className="flex items-center gap-2">
@@ -470,11 +598,11 @@ const WebScraper = () => {
                     </TableCell>
                     <TableCell>
                       <Badge variant="outline" className="bg-ai-purple/10 text-ai-purple border-0">
-                        {model.accuracy}%
+                        {model.accuracy !== null && model.accuracy !== undefined ? `${model.accuracy}%` : '--'}
                       </Badge>
                     </TableCell>
                     <TableCell className="text-right text-muted-foreground">
-                      {model.lastTrained.toLocaleDateString()}
+                      {model.lastTrained ? model.lastTrained.toLocaleDateString() : '--'}
                     </TableCell>
                   </TableRow>
                 ))}
@@ -539,7 +667,11 @@ const WebScraper = () => {
         </CardHeader>
         <CardContent>
           <div className="space-y-3">
-            {scrapeHistory.map((item, idx) => (
+            {scrapeHistory.length === 0 ? (
+              <div className="p-3 bg-muted/50 rounded-lg">
+                <p className="text-sm text-muted-foreground">No dataset metadata found yet.</p>
+              </div>
+            ) : scrapeHistory.map((item, idx) => (
               <div
                 key={idx}
                 className="flex items-center justify-between p-3 bg-muted/50 rounded-lg transition-all duration-200 hover:bg-muted/80"

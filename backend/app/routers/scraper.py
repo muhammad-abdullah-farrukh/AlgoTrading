@@ -54,6 +54,12 @@ class ScrapeResponse(BaseModel):
     message: str
 
 
+class AppendLiveResponse(BaseModel):
+    symbol: str
+    rows_appended: int
+    message: str
+
+
 @router.post("/start", response_model=ScrapeResponse)
 async def start_scraping(request: ScrapeRequest, background_tasks: BackgroundTasks):
     """
@@ -67,13 +73,25 @@ async def start_scraping(request: ScrapeRequest, background_tasks: BackgroundTas
     try:
         # Generate progress key
         progress_key = f"{request.symbol}_{datetime.utcnow().isoformat()}"
+
+        scraper_service._update_progress(
+            progress_key,
+            "_init",
+            "queued",
+            0,
+            f"Queued scraping for {request.symbol}"
+        )
+        if progress_key in scraper_service._progress:
+            scraper_service._progress[progress_key]['symbol'] = request.symbol
+            scraper_service._progress[progress_key]['status'] = 'queued'
         
         # Start scraping in background
         background_tasks.add_task(
             scraper_service.scrape_multiple_sources,
             request.symbol,
             request.sources,
-            request.source_params
+            request.source_params,
+            progress_key
         )
         
         return ScrapeResponse(
@@ -162,16 +180,28 @@ async def get_symbol_status(symbol: str):
         total_result = await session.execute(total_query)
         total_rows = total_result.scalar() or 0
         
-        # Rows per source
-        source_query = select(
-            OHLCV.source,
-            func.count(OHLCV.id).label('count')
-        ).where(
-            OHLCV.symbol == symbol
-        ).group_by(OHLCV.source)
-        
-        source_result = await session.execute(source_query)
-        rows_per_source = {row.source or 'unknown': row.count for row in source_result}
+        try:
+            # Rows per source
+            source_query = select(
+                OHLCV.source,
+                func.count(OHLCV.id).label('count')
+            ).where(
+                OHLCV.symbol == symbol
+            ).group_by(OHLCV.source)
+            
+            source_result = await session.execute(source_query)
+            rows_per_source = {row.source or 'unknown': row.count for row in source_result}
+        except Exception as e:
+            msg = str(e)
+            if 'no such column' in msg.lower() and 'ohlcv.source' in msg.lower():
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Database schema missing ohlcv.source. Restart the backend to run the auto-migration "
+                        "or recreate the database."
+                    ),
+                )
+            raise
         
         # Check minimum threshold
         from app.config import settings
@@ -234,3 +264,27 @@ async def list_available_sources():
         'sources': sources,
         'minimum_rows_per_symbol': settings.min_rows_per_symbol
     }
+
+
+@router.post("/append-live/{symbol}", response_model=AppendLiveResponse)
+async def append_live_data(symbol: str):
+    """Append recent OHLCV data from MT5 into the dataset for the given symbol."""
+    try:
+        rows_appended, error = await scraper_service.append_live_mt5_data(symbol)
+        if error:
+            raise HTTPException(status_code=400, detail=error)
+
+        return AppendLiveResponse(
+            symbol=symbol,
+            rows_appended=int(rows_appended),
+            message=(
+                f"Appended {rows_appended} live rows for {symbol}"
+                if rows_appended > 0
+                else f"No new live rows to append for {symbol}"
+            ),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to append live data: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to append live data: {str(e)}")

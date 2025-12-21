@@ -9,7 +9,7 @@ export interface MLModel {
   name: string;
   type: 'logistic_regression' | 'random_forest' | 'lstm' | 'ensemble';
   accuracy: number;
-  lastTrained: Date;
+  lastTrained: Date | null;
   datasetSize: number;
   isActive: boolean;
   featureImportance: { feature: string; weight: number }[];
@@ -38,6 +38,7 @@ const modelTypeColors: Record<MLModel['type'], string> = {
 
 export const ModelCard = ({ model, onSelect, onRetrain }: ModelCardProps) => {
   const isTraining = model.status === 'training';
+  const lastTrainedLabel = model.lastTrained ? model.lastTrained.toLocaleDateString() : '--';
 
   return (
     <Card className={cn(
@@ -76,10 +77,10 @@ export const ModelCard = ({ model, onSelect, onRetrain }: ModelCardProps) => {
             <p key={`samples-value-${model.id}-${model.datasetSize}`} className="text-2xl font-bold text-foreground break-words">{(model.datasetSize / 1000).toFixed(1)}k</p>
             <p className="text-xs text-muted-foreground">Samples</p>
           </div>
-          <div key={`lastTrained-${model.id}-${model.lastTrained.getTime()}`} className="text-center p-3 bg-muted/50 rounded-lg relative">
+          <div key={`lastTrained-${model.id}-${model.lastTrained ? model.lastTrained.getTime() : 'none'}`} className="text-center p-3 bg-muted/50 rounded-lg relative">
             <Calendar className="h-4 w-4 mx-auto mb-1 text-muted-foreground" />
-            <p key={`date-value-${model.id}-${model.lastTrained.getTime()}`} className="text-sm font-bold text-foreground break-words">
-              {model.lastTrained.toLocaleDateString()}
+            <p key={`date-value-${model.id}-${model.lastTrained ? model.lastTrained.getTime() : 'none'}`} className="text-sm font-bold text-foreground break-words">
+              {lastTrainedLabel}
             </p>
             <p className="text-xs text-muted-foreground">Last Trained</p>
           </div>
@@ -89,7 +90,9 @@ export const ModelCard = ({ model, onSelect, onRetrain }: ModelCardProps) => {
         <div>
           <p className="text-sm font-medium text-muted-foreground mb-2">Top Features</p>
           <div className="space-y-2">
-            {model.featureImportance.slice(0, 3).map((f) => (
+            {model.featureImportance.length === 0 ? (
+              <p className="text-xs text-muted-foreground">No feature weights available.</p>
+            ) : model.featureImportance.slice(0, 3).map((f) => (
               <div key={f.feature} className="flex items-center gap-2">
                 <span className="text-xs text-muted-foreground w-20 truncate">{f.feature}</span>
                 <div className="flex-1 h-2 bg-muted rounded-full overflow-hidden">

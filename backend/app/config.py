@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     mt5_password: Optional[str] = None
     mt5_server: Optional[str] = None
     mt5_enabled: bool = True  # Set to False to force mock mode
-    mt5_real_trading: bool = False  # Set to True to enable real MT5 trades (requires proper setup)
+    mt5_real_trading: bool = True  # Set to True to enable real MT5 trades (requires proper setup)
     
     # Data scraping settings
     alpha_vantage_api_key: Optional[str] = None

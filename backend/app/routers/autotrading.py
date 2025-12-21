@@ -2,8 +2,13 @@
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from typing import Optional
 from pydantic import BaseModel, Field
+from datetime import datetime, timedelta
+from sqlalchemy import select
+from app.database import db
+from app.models import TradingSettings
 from app.services.autotrading import autotrading_service
 from app.services.paper_trading import paper_trading_service
+from app.services.live_trade_logger import live_trade_logger, LiveTradeEvent
 from app.utils.logging import get_logger
 import asyncio
 
@@ -23,8 +28,49 @@ class AutotradingSettingsRequest(BaseModel):
     take_profit_percent: Optional[float] = Field(None, ge=0, le=100, description="Take profit percentage (e.g., 5.0 for 5%)")
     max_daily_loss: Optional[float] = Field(None, ge=0, description="Maximum daily loss amount")
     position_size: Optional[float] = Field(None, gt=0, description="Default position size")
+    timeframe: Optional[str] = Field(None, description="Preferred timeframe for AI signals (e.g., 1d, 1h, 15m)")
     auto_mode: Optional[bool] = Field(None, description="Auto vs manual mode")
     selected_strategy_id: Optional[int] = Field(None, description="Selected strategy ID")
+
+
+async def _get_live_mode_requested() -> bool:
+    async for session in db.get_session():
+        result = await session.execute(select(TradingSettings).limit(1))
+        settings = result.scalar_one_or_none()
+        return bool(settings.live_mode) if settings else False
+
+
+def _is_demo_server_name(server: Optional[str]) -> bool:
+    if not server:
+        return False
+    return "demo" in server.lower()
+
+
+def _is_demo_account(account_info: dict) -> bool:
+    try:
+        trade_mode = account_info.get('trade_mode')
+        if isinstance(trade_mode, int) and trade_mode == 0:
+            return True
+    except Exception:
+        pass
+    return _is_demo_server_name(account_info.get('server'))
+
+
+def _mt5_can_execute_live_orders(mt5_client) -> bool:
+    try:
+        from app.config import settings
+
+        status = mt5_client.get_detailed_status() if hasattr(mt5_client, "get_detailed_status") else {}
+        if not bool((status or {}).get('trading_enabled')):
+            return False
+
+        if bool(settings.mt5_real_trading):
+            return True
+
+        account_info = (status or {}).get('account_info') or {}
+        return _is_demo_account(account_info)
+    except Exception:
+        return False
 
 
 @router.get("/settings")
@@ -83,17 +129,32 @@ async def update_settings(request: AutotradingSettingsRequest):
 @router.post("/enable")
 async def enable_autotrading():
     """
-    Enable autotrading.
+    Enable autotrading and automatically start the trading loop.
     """
+    global _autotrading_task, _autotrading_running
+    
     try:
         settings, error = await autotrading_service.update_settings({'enabled': True})
         
         if error:
             raise HTTPException(status_code=400, detail=error)
         
+        # Automatically start the loop when autotrading is enabled
+        # Check if loop is already running to avoid duplicates
+        if _autotrading_task is None or _autotrading_task.done():
+            _autotrading_running = True
+            _autotrading_task = asyncio.create_task(_autotrading_loop())
+            logger.info("[Autotrading] Auto-started background loop on enable")
+        elif not _autotrading_running:
+            # Task exists but flag is False - restart it
+            _autotrading_running = True
+            logger.info("[Autotrading] Restarting background loop (flag was False)")
+        else:
+            logger.debug("[Autotrading] Loop already running, skipping start")
+        
         return {
             "status": "success",
-            "message": "Autotrading enabled",
+            "message": "Autotrading enabled and loop started automatically",
             "settings": settings
         }
         
@@ -107,17 +168,30 @@ async def enable_autotrading():
 @router.post("/disable")
 async def disable_autotrading():
     """
-    Disable autotrading.
+    Disable autotrading and automatically stop the trading loop.
     """
+    global _autotrading_task, _autotrading_running
+    
     try:
         settings, error = await autotrading_service.update_settings({'enabled': False})
         
         if error:
             raise HTTPException(status_code=400, detail=error)
         
+        # Automatically stop the loop when autotrading is disabled
+        if _autotrading_running:
+            _autotrading_running = False
+            if _autotrading_task:
+                _autotrading_task.cancel()
+                try:
+                    await _autotrading_task
+                except asyncio.CancelledError:
+                    pass
+            logger.info("[Autotrading] Auto-stopped background loop on disable")
+        
         return {
             "status": "success",
-            "message": "Autotrading disabled",
+            "message": "Autotrading disabled and loop stopped automatically",
             "settings": settings
         }
         
@@ -339,11 +413,11 @@ async def execute_strategy(background_tasks: BackgroundTasks):
         from app.routers.ml_training import _get_cached_dataset
         import pandas as pd
         
-        # Get timeframe from settings or use default
-        timeframe = "1d"  # Default timeframe
-        
-        # Check if model is available
-        if not signal_generator.is_model_available(timeframe):
+        # Get timeframe from settings or use default (respect user selection)
+        timeframe = settings.get('timeframe', "1d")  # Use setting or default
+        model_timeframe = signal_generator.resolve_model_timeframe(timeframe)
+
+        if not model_timeframe:
             return {
                 "status": "skipped",
                 "message": f"No trained model found for timeframe: {timeframe}",
@@ -367,6 +441,13 @@ async def execute_strategy(background_tasks: BackgroundTasks):
         
         from app.services.paper_trading import paper_trading_service
         
+        live_mode_requested = await _get_live_mode_requested()
+        from app.services import get_mt5_client
+        from app.services.mock_mt5 import MockMT5Client
+        mt5_client = get_mt5_client()
+        mt5_real_connected = mt5_client.is_connected and not isinstance(mt5_client, MockMT5Client)
+        can_execute_live = bool(live_mode_requested and mt5_real_connected and _mt5_can_execute_live_orders(mt5_client))
+
         for currency_pair in available_pairs:
             try:
                 # Get data for this pair
@@ -379,7 +460,7 @@ async def execute_strategy(background_tasks: BackgroundTasks):
                 # Generate signal
                 result = signal_generator.predict_next_period(
                     input_data=pair_data,
-                    timeframe=timeframe,
+                    timeframe=model_timeframe,
                     min_confidence=0.6  # Higher confidence for autotrading
                 )
                 
@@ -422,13 +503,53 @@ async def execute_strategy(background_tasks: BackgroundTasks):
                 # Execute trade
                 trade_type = 'buy' if signal_type == 'BUY' else 'sell'
                 
-                position, error = await paper_trading_service.open_position(
-                    currency_pair,
-                    trade_type,
-                    position_size,
-                    None,  # Use market price
-                    skip_controls=False  # Apply autotrading controls
-                )
+                position = None
+                error = None
+                if can_execute_live:
+                    comment = f"ATW2-AUTO-{trade_type[:1].upper()}-{currency_pair}"[:31]
+                    success, order_result, order_error = mt5_client.place_order(
+                        currency_pair,
+                        trade_type,
+                        position_size,
+                        None,
+                        comment=comment,
+                    )
+                    if not success:
+                        error = order_error or "MT5 order failed"
+                    else:
+                        try:
+                            live_trade_logger.record_trade(
+                                LiveTradeEvent(
+                                    timestamp=datetime.utcnow().isoformat(),
+                                    symbol=currency_pair,
+                                    side=trade_type,
+                                    quantity=float(position_size),
+                                    price=float((order_result or {}).get('price') or 0.0),
+                                    order_id=str((order_result or {}).get('order')) if (order_result or {}).get('order') is not None else None,
+                                    comment=comment,
+                                    source='mt5_autotrading',
+                                    timeframe=str(timeframe),
+                                    confidence=float(confidence),
+                                )
+                            )
+                        except Exception:
+                            pass
+                        position, _ = await paper_trading_service.open_position(
+                            currency_pair,
+                            trade_type,
+                            position_size,
+                            (order_result or {}).get('price'),
+                            skip_controls=False,
+                            external_order_id=str((order_result or {}).get('order')) if (order_result or {}).get('order') is not None else None
+                        )
+                else:
+                    position, error = await paper_trading_service.open_position(
+                        currency_pair,
+                        trade_type,
+                        position_size,
+                        None,
+                        skip_controls=False
+                    )
                 
                 if error:
                     skipped_signals.append({
@@ -443,7 +564,8 @@ async def execute_strategy(background_tasks: BackgroundTasks):
                         'type': trade_type,
                         'quantity': position_size,
                         'confidence': confidence,
-                        'position_id': position.get('id') if position else None
+                        'position_id': position.get('id') if position else None,
+                        'mt5_order': order_result if can_execute_live else None,
                     })
                     logger.info(
                         f"[Autotrading] Trade executed: {trade_type} {position_size} {currency_pair} "
@@ -460,7 +582,9 @@ async def execute_strategy(background_tasks: BackgroundTasks):
             "enabled": True,
             "executed_trades": executed_trades,
             "skipped_signals": skipped_signals,
-            "timeframe": timeframe
+            "timeframe": timeframe,
+            "model_timeframe": model_timeframe,
+            "live_mode": bool(can_execute_live)
         }
         
     except HTTPException:
@@ -471,15 +595,27 @@ async def execute_strategy(background_tasks: BackgroundTasks):
 
 
 async def _autotrading_loop():
-    """Background loop that periodically executes trading strategy."""
+    """
+    Background loop that periodically executes trading strategy.
+    This loop runs independently and persists even if frontend disconnects.
+    It checks database settings directly, not just the global flag.
+    """
     global _autotrading_running
     
-    while _autotrading_running:
+    logger.info("[Autotrading] Background loop started - will persist until explicitly disabled")
+    
+    while True:  # Run indefinitely, check database for enabled state
         try:
-            # Check if autotrading is still enabled
+            # ALWAYS check database settings (not just global flag)
             settings = await autotrading_service.get_settings()
+            
+            # Check if we should stop (global flag OR database says disabled)
+            if not _autotrading_running:
+                logger.info("[Autotrading] Loop stopping - global flag set to False")
+                break
+            
             if not settings or not settings.get('enabled', False):
-                logger.debug("[Autotrading] Loop paused - autotrading disabled")
+                logger.debug("[Autotrading] Loop paused - autotrading disabled in database")
                 await asyncio.sleep(60)  # Check every minute
                 continue
             
@@ -489,9 +625,11 @@ async def _autotrading_loop():
                 from app.routers.ml_training import _get_cached_dataset
                 import pandas as pd
                 
-                timeframe = "1d"
-                
-                if not signal_generator.is_model_available(timeframe):
+                # Get timeframe from settings or use default
+                timeframe = settings.get('timeframe', "1d") if settings else "1d"
+                model_timeframe = signal_generator.resolve_model_timeframe(timeframe)
+
+                if not model_timeframe:
                     await asyncio.sleep(300)  # Wait 5 minutes if no model
                     continue
                 
@@ -500,21 +638,114 @@ async def _autotrading_loop():
                     await asyncio.sleep(300)  # Wait 5 minutes if no data
                     continue
                 
-                # Execute trades (same logic as execute_strategy endpoint)
-                available_pairs = df['currency_pair'].unique().tolist()[:5]
+                # Execute trades (optimized for speed)
+                available_pairs = df['currency_pair'].unique().tolist()[:3]  # Only 3 pairs for speed
+
+                live_mode_requested = await _get_live_mode_requested()
+                from app.services import get_mt5_client
+                from app.services.mock_mt5 import MockMT5Client
+                mt5_client = get_mt5_client()
+                mt5_real_connected = mt5_client.is_connected and not isinstance(mt5_client, MockMT5Client)
+                can_execute_live = bool(live_mode_requested and mt5_real_connected and _mt5_can_execute_live_orders(mt5_client))
                 
                 for currency_pair in available_pairs:
                     try:
-                        pair_data = df[df['currency_pair'] == currency_pair].copy()
-                        pair_data = pair_data.sort_values('date').tail(50)
+                        # Try to get REAL-TIME data from MT5/database first
+                        pair_data = None
+                        try:
+                            from app.services import get_mt5_client
+                            from app.database import db
+                            from app.models import OHLCV
+                            from sqlalchemy import select, desc
+                            from datetime import timedelta
+                            
+                            mt5_client = get_mt5_client()
+                            
+                            # Try MT5 first for real-time data
+                            if mt5_client.is_connected:
+                                try:
+                                    timeframe_map = {
+                                        '1m': 'M1', '3m': 'M1', '5m': 'M5', '15m': 'M15', '30m': 'M30', '45m': 'M15',
+                                        '1h': 'H1', '2h': 'H1', '3h': 'H1', '4h': 'H4',
+                                        '1d': 'D1', '1w': 'W1',
+                                        '1M': 'MN1', '3M': 'MN1', '6M': 'MN1', '12M': 'MN1'
+                                    }
+                                    mt5_tf = timeframe_map.get(timeframe, timeframe_map.get(timeframe.lower(), 'H1'))
+                                    
+                                    end_time = datetime.utcnow()
+                                    if mt5_tf.startswith('M'):
+                                        minutes = int(mt5_tf[1:]) if len(mt5_tf) > 1 else 1
+                                        start_time = end_time - timedelta(minutes=minutes * 20)
+                                    elif mt5_tf.startswith('H'):
+                                        hours = int(mt5_tf[1:]) if len(mt5_tf) > 1 else 1
+                                        start_time = end_time - timedelta(hours=hours * 20)
+                                    elif mt5_tf == 'D1':
+                                        start_time = end_time - timedelta(days=20)
+                                    else:
+                                        start_time = end_time - timedelta(hours=20)
+                                    
+                                    ohlcv_df = mt5_client.get_ohlcv(currency_pair, mt5_tf, start=start_time, end=end_time)
+                                    
+                                    if not ohlcv_df.empty:
+                                        ohlcv_df = ohlcv_df.rename(columns={'timestamp': 'date', 'close': 'close_price'})
+                                        ohlcv_df['currency_pair'] = currency_pair
+                                        pair_data = ohlcv_df.copy()
+                                except Exception as e:
+                                    logger.debug(f"MT5 data fetch failed: {str(e)}")
+                            
+                            # Fallback to database
+                            if pair_data is None or pair_data.empty:
+                                async for session in db.get_session():
+                                    query = (
+                                        select(OHLCV)
+                                        .where(OHLCV.symbol == currency_pair)
+                                        .order_by(desc(OHLCV.timestamp))
+                                        .limit(20)
+                                    )
+                                    result = await session.execute(query)
+                                    rows = result.scalars().all()
+                                    
+                                    if rows:
+                                        import pandas as pd
+                                        data = []
+                                        for row in rows:
+                                            data.append({
+                                                'date': row.timestamp,
+                                                'close_price': row.close,
+                                                'open': row.open,
+                                                'high': row.high,
+                                                'low': row.low,
+                                                'volume': row.volume,
+                                                'currency_pair': currency_pair
+                                            })
+                                        pair_data = pd.DataFrame(data)
+                                        pair_data = pair_data.sort_values('date')
+                                    break
+                        except Exception as e:
+                            logger.debug(f"Real-time data fetch failed: {str(e)}")
                         
-                        if len(pair_data) < 20:
+                        # Fallback to CSV
+                        if pair_data is None or pair_data.empty:
+                            pair_data = df[df['currency_pair'] == currency_pair].copy()
+                            if len(pair_data) == 0:
+                                continue
+                            pair_data = pair_data.sort_values('date').tail(20)
+                        
+                        if len(pair_data) < 10:
                             continue
                         
-                        result = signal_generator.predict_next_period(
-                            input_data=pair_data,
-                            timeframe=timeframe,
-                            min_confidence=0.6
+                        # Use async executor for faster prediction
+                        def generate_signal():
+                            return signal_generator.predict_next_period(
+                                input_data=pair_data,
+                                timeframe=model_timeframe,
+                                min_confidence=0.6
+                            )
+                        
+                        loop = asyncio.get_event_loop()
+                        result = await asyncio.wait_for(
+                            loop.run_in_executor(None, generate_signal),
+                            timeout=2.0  # 2 second timeout
                         )
                         
                         if result.get('error') or result.get('signal') == 'HOLD':
@@ -539,19 +770,78 @@ async def _autotrading_loop():
                         
                         trade_type = 'buy' if signal_type == 'BUY' else 'sell'
                         
-                        position, error = await paper_trading_service.open_position(
-                            currency_pair,
-                            trade_type,
-                            position_size,
-                            None,
-                            skip_controls=False
-                        )
+                        position = None
+                        error = None
+                        if can_execute_live:
+                            comment = f"ATW2-AUTO-{trade_type[:1].upper()}-{currency_pair}"[:31]
+                            success, order_result, order_error = mt5_client.place_order(
+                                currency_pair,
+                                trade_type,
+                                position_size,
+                                None,
+                                comment=comment,
+                            )
+                            if not success:
+                                error = order_error or "MT5 order failed"
+                            else:
+                                try:
+                                    live_trade_logger.record_trade(
+                                        LiveTradeEvent(
+                                            timestamp=datetime.utcnow().isoformat(),
+                                            symbol=currency_pair,
+                                            side=trade_type,
+                                            quantity=float(position_size),
+                                            price=float((order_result or {}).get('price') or 0.0),
+                                            order_id=str((order_result or {}).get('order')) if (order_result or {}).get('order') is not None else None,
+                                            comment=comment,
+                                            source='mt5_autotrading',
+                                            timeframe=str(timeframe),
+                                            confidence=float(confidence),
+                                        )
+                                    )
+                                except Exception:
+                                    pass
+                                position, _ = await paper_trading_service.open_position(
+                                    currency_pair,
+                                    trade_type,
+                                    position_size,
+                                    (order_result or {}).get('price'),
+                                    skip_controls=False,
+                                    external_order_id=str((order_result or {}).get('order')) if (order_result or {}).get('order') is not None else None
+                                )
+                        else:
+                            position, error = await paper_trading_service.open_position(
+                                currency_pair,
+                                trade_type,
+                                position_size,
+                                None,
+                                skip_controls=False
+                            )
                         
                         if not error and position:
                             logger.info(
                                 f"[Autotrading] Auto-trade executed: {trade_type} {position_size} {currency_pair} "
                                 f"(confidence: {confidence:.2f})"
                             )
+                            
+                            # Send WebSocket notification for autotrading trade
+                            try:
+                                from app.websocket import manager
+                                notification_data = {
+                                    'type': 'autotrading_trade',
+                                    'trade': {
+                                        'symbol': currency_pair,
+                                        'action': trade_type.upper(),
+                                        'quantity': position_size,
+                                        'price': position.get('average_price', 0),
+                                        'confidence': confidence,
+                                        'timestamp': datetime.utcnow().isoformat()
+                                    }
+                                }
+                                await manager.broadcast(notification_data)
+                                logger.debug(f"[Autotrading] Notification sent for {trade_type} {currency_pair}")
+                            except Exception as notif_error:
+                                logger.debug(f"[Autotrading] Failed to send notification: {str(notif_error)}")
                             
                     except Exception as e:
                         logger.debug(f"[Autotrading] Error processing {currency_pair}: {str(e)}")
@@ -560,8 +850,8 @@ async def _autotrading_loop():
             except Exception as e:
                 logger.error(f"[Autotrading] Strategy execution error: {str(e)}")
             
-            # Wait 5 minutes before next execution
-            await asyncio.sleep(300)
+            # Wait 1 minute before next execution (faster trading)
+            await asyncio.sleep(60)
             
         except asyncio.CancelledError:
             logger.info("[Autotrading] Loop cancelled")

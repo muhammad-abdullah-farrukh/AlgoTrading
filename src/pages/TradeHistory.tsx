@@ -5,13 +5,13 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { TradeTable } from '@/components/trading/TradeTable';
-import { Trade } from '@/utils/dummyData';
-import { useTrades } from '@/contexts/TradesContext';
+import { useTrades, type Trade } from '@/contexts/TradesContext';
 import { Search, Download, Filter, RotateCcw, Calendar } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import api from '@/utils/api';
+import { toast } from 'sonner';
 
 interface TradeFilters {
-  tradeType: string;
   side: string;
   profitLoss: string;
   status: string;
@@ -22,7 +22,6 @@ interface TradeFilters {
 }
 
 const defaultFilters: TradeFilters = {
-  tradeType: 'all',
   side: 'all',
   profitLoss: 'all',
   status: 'all',
@@ -93,20 +92,44 @@ const TradeHistory = () => {
     return value !== 'all';
   });
 
-  const handleExport = () => {
-    const csvContent = [
-      'ID,Symbol,Action,Quantity,Price,Date,P/L,Status',
-      ...filteredTrades.map(t => 
-        `${t.id},${t.symbol},${t.action},${t.quantity},${t.price},${t.timestamp.toISOString()},${t.profitLoss},${t.status}`
-      )
-    ].join('\n');
-    
-    const blob = new Blob([csvContent], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'trade-history.csv';
-    a.click();
+  const handleExport = async () => {
+    try {
+      const params: Record<string, string> = { format: 'csv' };
+      if (filters.symbol !== 'all') params.symbol = filters.symbol;
+      if (filters.side !== 'all') params.side = filters.side;
+      if (filters.status !== 'all') params.status = filters.status === 'completed' ? 'executed' : filters.status;
+      if (filters.profitLoss === 'profit') params.min_profit = '0';
+      if (filters.profitLoss === 'loss') params.max_profit = '0';
+      if (filters.dateFrom) params.start_date = filters.dateFrom;
+      if (filters.dateTo) params.end_date = filters.dateTo;
+
+      const response = await fetch(`${api.baseURL}/api/trade/history/export?${new URLSearchParams(params).toString()}`);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || `Export failed: ${response.status}`);
+      }
+
+      const disposition = response.headers.get('content-disposition') || '';
+      const match = disposition.match(/filename=([^;]+)/i);
+      const filename = match ? match[1].replace(/\"/g, '').trim() : 'trade-history.csv';
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+
+      toast.success('Export started', { description: filename });
+    } catch (error) {
+      console.error('[TradeHistory] Export failed:', error);
+      toast.error('Export failed', {
+        description: (error as any)?.message || `API: ${api.baseURL}`
+      });
+    }
   };
 
   return (
@@ -191,22 +214,6 @@ const TradeHistory = () => {
               </div>
             </div>
 
-            {/* Trade Type */}
-            <div className="space-y-2">
-              <Label className="text-xs text-muted-foreground">Trade Type</Label>
-              <Select value={filters.tradeType} onValueChange={(v) => updateFilter('tradeType', v)}>
-                <SelectTrigger className="bg-secondary border-0">
-                  <SelectValue placeholder="All Types" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All Types</SelectItem>
-                  <SelectItem value="market">Market</SelectItem>
-                  <SelectItem value="limit">Limit</SelectItem>
-                  <SelectItem value="stop">Stop</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-
             {/* Side */}
             <div className="space-y-2">
               <Label className="text-xs text-muted-foreground">Side</Label>
@@ -246,8 +253,9 @@ const TradeHistory = () => {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="all">All Status</SelectItem>
-                  <SelectItem value="Open">Open</SelectItem>
-                  <SelectItem value="Closed">Closed</SelectItem>
+                  <SelectItem value="completed">Completed</SelectItem>
+                  <SelectItem value="pending">Pending</SelectItem>
+                  <SelectItem value="cancelled">Cancelled</SelectItem>
                 </SelectContent>
               </Select>
             </div>

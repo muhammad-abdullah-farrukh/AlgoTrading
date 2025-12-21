@@ -207,6 +207,16 @@ class MT5Client:
             
             # Rename and reorder columns to match unified schema
             rates_df = rates_df.rename(columns={'time': 'timestamp'})
+
+            # MT5 rates use tick_volume/real_volume (not always a `volume` column).
+            if 'volume' not in rates_df.columns:
+                if 'real_volume' in rates_df.columns:
+                    rates_df['volume'] = rates_df['real_volume']
+                elif 'tick_volume' in rates_df.columns:
+                    rates_df['volume'] = rates_df['tick_volume']
+                else:
+                    rates_df['volume'] = 0
+
             rates_df = rates_df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
             
             logger.info(f"Retrieved {len(rates_df)} OHLCV bars for {symbol} {timeframe}")
@@ -266,6 +276,7 @@ class MT5Client:
                     'company': account_info.company,
                     'trade_allowed': bool(account_info.trade_allowed),
                     'trade_expert': bool(account_info.trade_expert),
+                    'trade_mode': int(getattr(account_info, 'trade_mode', -1)),
                 }
             else:
                 status['logged_in'] = False
@@ -334,3 +345,241 @@ class MT5Client:
         except Exception as e:
             logger.error(f"Error getting symbol info for {symbol}: {str(e)}")
             return None
+    
+    def place_order(self, symbol: str, order_type: str, volume: float, 
+                   price: Optional[float] = None, sl: Optional[float] = None, 
+                   tp: Optional[float] = None, comment: str = "") -> Tuple[bool, Optional[dict], Optional[str]]:
+        """
+        Place a trading order on MT5.
+        
+        Args:
+            symbol: Trading symbol
+            order_type: 'buy' or 'sell'
+            volume: Lot size
+            price: Optional limit price (uses market price if None)
+            sl: Optional stop loss price
+            tp: Optional take profit price
+            comment: Optional order comment
+            
+        Returns:
+            Tuple of (success, order_result, error_message)
+        """
+        if not self._connected:
+            return False, None, "MT5 not connected"
+        
+        try:
+            symbol_info = mt5.symbol_info(symbol)
+            if symbol_info is None:
+                return False, None, f"Symbol {symbol} not found"
+            
+            if not symbol_info.visible:
+                if not mt5.symbol_select(symbol, True):
+                    return False, None, f"Failed to select symbol {symbol}"
+            
+            point = symbol_info.point
+            
+            if order_type.lower() == 'buy':
+                order_type_mt5 = mt5.ORDER_TYPE_BUY
+                price = symbol_info.ask if price is None else price
+            elif order_type.lower() == 'sell':
+                order_type_mt5 = mt5.ORDER_TYPE_SELL
+                price = symbol_info.bid if price is None else price
+            else:
+                return False, None, f"Invalid order type: {order_type}"
+            
+            base_request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": float(volume),
+                "type": order_type_mt5,
+                "price": price,
+                "deviation": 20,
+                "magic": 234000,
+                "comment": comment or "AlgoTradeWeb2",
+                "type_time": mt5.ORDER_TIME_GTC,
+            }
+            
+            if sl is not None:
+                base_request["sl"] = sl
+            if tp is not None:
+                base_request["tp"] = tp
+
+            preferred_mode = None
+            try:
+                preferred_mode = getattr(symbol_info, 'filling_mode', None)
+                if preferred_mode is None:
+                    preferred_mode = getattr(symbol_info, 'trade_fill_mode', None)
+            except Exception:
+                preferred_mode = None
+
+            candidate_modes = [None]
+            known_modes = {mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN}
+            if isinstance(preferred_mode, int) and preferred_mode in known_modes:
+                candidate_modes.append(preferred_mode)
+            candidate_modes.extend([mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN])
+
+            # de-dup while preserving order
+            filling_modes = []
+            for m in candidate_modes:
+                if m not in filling_modes:
+                    filling_modes.append(m)
+
+            last_err = None
+            result = None
+            selected_mode = None
+            for mode in filling_modes:
+                request = dict(base_request)
+                if mode is not None:
+                    request["type_filling"] = mode
+                result = mt5.order_send(request)
+
+                if result is None:
+                    last_err = mt5.last_error()
+                    continue
+
+                if result.retcode == mt5.TRADE_RETCODE_DONE:
+                    selected_mode = mode
+                    break
+
+                last_err = f"{result.comment} (code: {result.retcode})"
+                retcode = int(getattr(result, 'retcode', -1))
+                comment_lower = str(getattr(result, 'comment', '') or '').lower()
+                if retcode == 10030 or 'filling' in comment_lower:
+                    continue
+            
+            if result is None:
+                return False, None, f"Order send failed: {last_err}"
+            
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                return False, None, f"Order failed: {result.comment} (code: {result.retcode})"
+            
+            order_result = {
+                'order': result.order,
+                'volume': result.volume,
+                'price': result.price,
+                'bid': result.bid,
+                'ask': result.ask,
+                'comment': result.comment,
+                'request_id': result.request_id,
+                'type_filling': selected_mode,
+            }
+            
+            logger.info(
+                f"Order placed successfully: {order_type} {volume} {symbol} @ {result.price} "
+                f"(type_filling={selected_mode})"
+            )
+            return True, order_result, None
+            
+        except Exception as e:
+            logger.error(f"Error placing order: {str(e)}")
+            return False, None, f"Order error: {str(e)}"
+    
+    def close_position(self, position_id: int) -> Tuple[bool, Optional[dict], Optional[str]]:
+        """
+        Close an open position.
+        
+        Args:
+            position_id: Position ticket/ID to close
+            
+        Returns:
+            Tuple of (success, close_result, error_message)
+        """
+        if not self._connected:
+            return False, None, "MT5 not connected"
+        
+        try:
+            positions = mt5.positions_get(ticket=position_id)
+            if positions is None or len(positions) == 0:
+                return False, None, f"Position {position_id} not found"
+            
+            position = positions[0]
+            
+            symbol_info = mt5.symbol_info(position.symbol)
+            if symbol_info is None:
+                return False, None, f"Symbol {position.symbol} not found"
+            
+            if position.type == mt5.ORDER_TYPE_BUY:
+                order_type = mt5.ORDER_TYPE_SELL
+                price = symbol_info.bid
+            else:
+                order_type = mt5.ORDER_TYPE_BUY
+                price = symbol_info.ask
+            
+            base_request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": position.symbol,
+                "volume": position.volume,
+                "type": order_type,
+                "position": position_id,
+                "price": price,
+                "deviation": 20,
+                "magic": 234000,
+                "comment": "Close position",
+                "type_time": mt5.ORDER_TIME_GTC,
+            }
+
+            preferred_mode = None
+            try:
+                preferred_mode = getattr(symbol_info, 'filling_mode', None)
+                if preferred_mode is None:
+                    preferred_mode = getattr(symbol_info, 'trade_fill_mode', None)
+            except Exception:
+                preferred_mode = None
+
+            candidate_modes = [None]
+            known_modes = {mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN}
+            if isinstance(preferred_mode, int) and preferred_mode in known_modes:
+                candidate_modes.append(preferred_mode)
+            candidate_modes.extend([mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN])
+
+            filling_modes = []
+            for m in candidate_modes:
+                if m not in filling_modes:
+                    filling_modes.append(m)
+
+            last_err = None
+            result = None
+            selected_mode = None
+            for mode in filling_modes:
+                request = dict(base_request)
+                if mode is not None:
+                    request["type_filling"] = mode
+                result = mt5.order_send(request)
+
+                if result is None:
+                    last_err = mt5.last_error()
+                    continue
+
+                if result.retcode == mt5.TRADE_RETCODE_DONE:
+                    selected_mode = mode
+                    break
+
+                last_err = f"{result.comment} (code: {result.retcode})"
+                retcode = int(getattr(result, 'retcode', -1))
+                comment_lower = str(getattr(result, 'comment', '') or '').lower()
+                if retcode == 10030 or 'filling' in comment_lower:
+                    continue
+            
+            if result is None:
+                return False, None, f"Close order failed: {last_err}"
+            
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                return False, None, f"Close failed: {result.comment} (code: {result.retcode})"
+            
+            close_result = {
+                'order': result.order,
+                'volume': result.volume,
+                'price': result.price,
+                'profit': position.profit,
+                'type_filling': selected_mode,
+            }
+            
+            logger.info(
+                f"Position {position_id} closed successfully @ {result.price} "
+                f"(type_filling={selected_mode})"
+            )
+            return True, close_result, None
+            
+        except Exception as e:
+            logger.error(f"Error closing position: {str(e)}")
+            return False, None, f"Close error: {str(e)}"

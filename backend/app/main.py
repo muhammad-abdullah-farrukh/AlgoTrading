@@ -7,7 +7,7 @@ from app.config import settings
 from app.database import db
 from app.routers import health
 from app.routers.websocket import router as websocket_router
-from app.routers import scraper, integrity, indicators, trading, autotrading, ml_training
+from app.routers import scraper, integrity, indicators, trading, autotrading, ml_training, strategies
 from app.utils.logging import setup_logging, get_logger
 import asyncio
 
@@ -213,6 +213,26 @@ async def lifespan(app: FastAPI):
         from app.services.autotrading import autotrading_service
         logger.info("✓ Paper trading service ready")
         logger.info("✓ Autotrading service ready")
+        
+        # Restore autotrading state from database on startup
+        try:
+            autotrading_settings = await autotrading_service.get_settings()
+            if autotrading_settings and autotrading_settings.get('enabled', False):
+                logger.info("Restoring autotrading state from database...")
+                # Import here to avoid circular imports
+                import app.routers.autotrading as autotrading_router
+                import asyncio
+                
+                # Start the loop if autotrading was enabled
+                if not autotrading_router._autotrading_running or autotrading_router._autotrading_task is None or autotrading_router._autotrading_task.done():
+                    autotrading_router._autotrading_running = True
+                    autotrading_router._autotrading_task = asyncio.create_task(autotrading_router._autotrading_loop())
+                    logger.info("✓ Autotrading loop restored and started")
+                else:
+                    logger.info("✓ Autotrading loop already running")
+        except Exception as e:
+            logger.warning(f"⚠ Failed to restore autotrading state: {str(e)}")
+            # Non-critical, continue
     except Exception as e:
         error_msg = f"Trading services initialization failed: {str(e)}"
         logger.error(f"✗ {error_msg}")
@@ -274,7 +294,23 @@ async def lifespan(app: FastAPI):
         logger.error(f"[ERROR] {error_msg}")
         shutdown_errors.append(error_msg)
     
-    # 2. Cancel all remaining pending asyncio tasks (except current one)
+    # 2. Stop autotrading loop first (before cancelling all tasks)
+    try:
+        logger.info("Stopping autotrading loop...")
+        import app.routers.autotrading as autotrading_router
+        if autotrading_router._autotrading_running:
+            autotrading_router._autotrading_running = False
+            if autotrading_router._autotrading_task and not autotrading_router._autotrading_task.done():
+                autotrading_router._autotrading_task.cancel()
+                try:
+                    await asyncio.wait_for(autotrading_router._autotrading_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+        logger.info("[OK] Autotrading loop stopped")
+    except Exception as e:
+        logger.warning(f"[WARNING] Error stopping autotrading loop: {str(e)}")
+    
+    # 3. Cancel all remaining pending asyncio tasks (except current one)
     # This ensures any remaining tasks (e.g., background tasks) are cancelled
     try:
         logger.info("Cancelling remaining pending tasks...")
@@ -309,8 +345,19 @@ async def lifespan(app: FastAPI):
         logger.warning(f"[WARNING] {error_msg}")
         shutdown_errors.append(error_msg)
     
-    # 3. Shutdown MT5 Client (with timeout)
+    # 4. Shutdown MT5 Client (with timeout)
     try:
+        try:
+            from app.services.live_trade_logger import live_trade_logger
+
+            flushed, path, err = live_trade_logger.flush_to_datasets()
+            if err:
+                shutdown_errors.append(err)
+            elif flushed:
+                logger.info(f"[OK] Flushed {flushed} live trade(s) to dataset queue: {path}")
+        except Exception as e:
+            shutdown_errors.append(f"Live trade flush error: {str(e)}")
+
         logger.info("Shutting down MT5 client...")
         from app.services import get_mt5_client
         mt5_client = get_mt5_client()
@@ -334,7 +381,7 @@ async def lifespan(app: FastAPI):
         logger.warning(f"[WARNING] {error_msg}")
         shutdown_errors.append(error_msg)
     
-    # 4. Disconnect Database (with timeout)
+    # 5. Disconnect Database (with timeout)
     try:
         logger.info("Disconnecting from database...")
         await asyncio.wait_for(
@@ -447,6 +494,8 @@ app.include_router(integrity.router)
 app.include_router(indicators.router)
 # Trading endpoints
 app.include_router(trading.router)
+# Strategies endpoints
+app.include_router(strategies.router)
 # Autotrading endpoints
 app.include_router(autotrading.router)
 # ML Training endpoints

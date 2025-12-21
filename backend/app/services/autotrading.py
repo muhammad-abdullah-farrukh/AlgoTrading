@@ -45,6 +45,7 @@ class AutotradingService:
                     'take_profit_percent': float(settings.take_profit_percent) if settings.take_profit_percent else None,
                     'max_daily_loss': float(settings.max_daily_loss) if settings.max_daily_loss else None,
                     'position_size': float(settings.position_size) if settings.position_size else None,
+                    'timeframe': str(settings.timeframe) if getattr(settings, 'timeframe', None) else '1d',
                     'auto_mode': settings.auto_mode,
                     'selected_strategy_id': settings.selected_strategy_id,
                     'daily_loss_reset_date': settings.daily_loss_reset_date.isoformat() if settings.daily_loss_reset_date else None,
@@ -103,6 +104,10 @@ class AutotradingService:
                 if 'position_size' in settings_dict:
                     value = settings_dict['position_size']
                     settings.position_size = float(value) if value is not None else None
+
+                if 'timeframe' in settings_dict:
+                    value = settings_dict['timeframe']
+                    settings.timeframe = str(value) if value is not None else None
                 
                 if 'auto_mode' in settings_dict:
                     settings.auto_mode = bool(settings_dict['auto_mode'])
@@ -124,6 +129,7 @@ class AutotradingService:
                     'take_profit_percent': float(settings.take_profit_percent) if settings.take_profit_percent else None,
                     'max_daily_loss': float(settings.max_daily_loss) if settings.max_daily_loss else None,
                     'position_size': float(settings.position_size) if settings.position_size else None,
+                    'timeframe': str(settings.timeframe) if getattr(settings, 'timeframe', None) else '1d',
                     'auto_mode': settings.auto_mode,
                     'selected_strategy_id': settings.selected_strategy_id,
                     'daily_loss_reset_date': settings.daily_loss_reset_date.isoformat() if settings.daily_loss_reset_date else None,

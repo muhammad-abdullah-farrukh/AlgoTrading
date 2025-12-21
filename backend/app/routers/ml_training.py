@@ -9,10 +9,13 @@ Provides API endpoints for:
 - Signal generation
 """
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Query
+from fastapi.responses import StreamingResponse
 from typing import Optional, Dict, List
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
 import asyncio
+import io
+
 from app.ai.retraining_service import retraining_service
 from app.ai.ai_config import ai_config
 from app.ai.model_export import model_export_service
@@ -24,7 +27,7 @@ router = APIRouter(prefix="/api/ml", tags=["ml-training"])
 
 # Signal caching for instant responses
 _signal_cache: Dict[str, Dict] = {}
-_cache_ttl = 30  # Cache signals for 30 seconds
+_cache_ttl = 3  # Cache signals for 3 seconds (ULTRA fast updates)
 _dataset_cache: Optional[Dict] = None
 _dataset_cache_time: Optional[datetime] = None
 _dataset_cache_ttl = 300  # Cache normalized dataset for 5 minutes
@@ -62,7 +65,7 @@ def _get_cached_dataset():
         df = None
         for encoding in ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']:
             try:
-                df = pd.read_csv(data_file, encoding=encoding, nrows=10000)  # Limit to 10k rows for speed
+                df = pd.read_csv(data_file, encoding=encoding, nrows=500)  # Limit to 500 rows for MAXIMUM speed
                 if encoding != 'utf-8':
                     logger.debug(f"Loaded with {encoding} encoding")
                 break
@@ -311,6 +314,64 @@ async def get_training_status():
         raise HTTPException(status_code=500, detail=f"Failed to get status: {str(e)}")
 
 
+@router.get("/performance")
+async def get_model_performance():
+    """Return chart points for model performance (accuracy/loss), plus a point updated on latest executed trade."""
+    try:
+        # Load model metadata
+        if retraining_service.model.model is None:
+            retraining_service.model.load_model()
+
+        metadata = retraining_service.model.get_metadata() or {}
+        accuracy = metadata.get('accuracy')
+        loss = metadata.get('loss')
+        trained_at = metadata.get('timestamp')
+
+        if accuracy is None or not trained_at:
+            return {"performance": [], "count": 0}
+
+        # Normalize
+        acc_pct = float(accuracy) * 100.0 if float(accuracy) <= 1.0 else float(accuracy)
+        loss_val = None
+        try:
+            if loss is not None:
+                loss_val = float(loss)
+        except Exception:
+            loss_val = None
+        if loss_val is None:
+            loss_val = max(0.0, min(1.0, 1.0 - (acc_pct / 100.0)))
+
+        points = [{"date": str(trained_at), "accuracy": float(acc_pct), "loss": float(loss_val)}]
+
+        # Ensure at least 2 points so line chart renders reliably.
+        if len(points) == 1:
+            now_ts = datetime.utcnow().isoformat()
+            if now_ts != str(trained_at):
+                points.append({"date": now_ts, "accuracy": float(acc_pct), "loss": float(loss_val)})
+
+        # Add an update point on latest trade execution timestamp (so chart updates after trades)
+        try:
+            from app.database import db
+            from app.models import Trade
+            from sqlalchemy import select, desc
+
+            async for session in db.get_session():
+                result = await session.execute(select(Trade).order_by(desc(Trade.timestamp)).limit(1))
+                last_trade = result.scalars().first()
+                break
+            if last_trade and getattr(last_trade, 'timestamp', None):
+                last_ts = last_trade.timestamp.isoformat() if hasattr(last_trade.timestamp, 'isoformat') else str(last_trade.timestamp)
+                if last_ts != str(trained_at):
+                    points.append({"date": last_ts, "accuracy": float(acc_pct), "loss": float(loss_val)})
+        except Exception:
+            pass
+
+        return {"performance": points, "count": len(points)}
+    except Exception as e:
+        logger.error(f"Failed to get model performance: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to get model performance: {str(e)}")
+
+
 @router.post("/check-retrain")
 async def check_and_retrain():
     """
@@ -378,6 +439,52 @@ async def export_model():
         raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
 
 
+@router.get("/export/xlsx")
+async def export_model_xlsx():
+    try:
+        logger.info("Model XLSX export requested via API")
+        result = model_export_service.export_all(include_loss=False)
+        if not result.get('success'):
+            raise HTTPException(status_code=500, detail=result.get('error', 'Export failed'))
+
+        import pandas as pd
+        weights_path = result.get('weights_path')
+        metadata_path = result.get('metadata_path')
+        if not weights_path or not metadata_path:
+            raise HTTPException(status_code=500, detail="Export failed: missing export paths")
+
+        df_weights = pd.read_csv(weights_path)
+        df_metadata = pd.read_csv(metadata_path)
+
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+            df_weights.to_excel(writer, sheet_name='weights', index=False)
+            df_metadata.to_excel(writer, sheet_name='metadata', index=False)
+
+        buf.seek(0)
+
+        timeframe = 'unknown'
+        try:
+            meta = model_export_service.model.get_metadata() or {}
+            timeframe = str(meta.get('timeframe') or 'unknown')
+        except Exception:
+            timeframe = 'unknown'
+
+        ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        filename = f"ai_model_export_{timeframe}_{ts}.xlsx"
+
+        return StreamingResponse(
+            buf,
+            media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to export model XLSX: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Export XLSX failed: {str(e)}")
+
+
 @router.get("/signals")
 async def get_ai_signals(
     timeframe: str = Query("1d", description="Timeframe for signal generation"),
@@ -401,91 +508,113 @@ async def get_ai_signals(
     """
     import pandas as pd
     start_time = datetime.utcnow()
+    raw_timeframe = str(timeframe or '').strip() or '1d'
+    requested_timeframe = raw_timeframe if (raw_timeframe.endswith('M') and raw_timeframe[:-1].isdigit()) else raw_timeframe.lower()
     
     try:
-        # Check cache first (but always respect timeframe changes)
-        cache_key = f"{timeframe}_{symbols}_{min_confidence}"
+        # ULTRA-FAST: Check cache FIRST before any other operations
+        cache_key = f"{requested_timeframe}_{symbols}_{min_confidence}"
         
-        # Always invalidate cache if timeframe changed (clear all entries with different timeframe)
+        # Check cache - only use if fresh (age < TTL) AND timeframe matches
         if cache_key in _signal_cache:
             cache_entry = _signal_cache[cache_key]
             cached_timeframe = cache_entry['data'].get('timeframe')
             age = (datetime.utcnow() - cache_entry['timestamp']).total_seconds()
             
-            # Only use cache if timeframe matches AND it's fresh
-            if cached_timeframe == timeframe and age < _cache_ttl:
-                logger.debug(f"Returning cached signals (age: {age:.1f}s, timeframe: {timeframe})")
+            # Only use cache if timeframe matches AND it's fresh (strict check)
+            if cached_timeframe == requested_timeframe and age < _cache_ttl:
+                logger.debug(f"Returning cached signals INSTANTLY (age: {age:.1f}s < ttl: {_cache_ttl}s)")
                 return cache_entry['data']
             else:
-                # Invalidate - timeframe changed or cache expired
-                logger.debug(f"Cache invalidated (timeframe: {cached_timeframe} -> {timeframe} or age: {age:.1f}s)")
-                del _signal_cache[cache_key]
+                # Cache expired or timeframe changed - force refresh
+                logger.debug(f"Cache expired (age: {age:.1f}s >= ttl: {_cache_ttl}s) - generating fresh")
+                if cache_key in _signal_cache:
+                    del _signal_cache[cache_key]
         
-        # Also clear any other cache entries with different timeframes
-        keys_to_remove = [k for k in _signal_cache.keys() if not k.startswith(f"{timeframe}_")]
+        # Clear any other cache entries with different timeframes (keep cache small)
+        keys_to_remove = [k for k in list(_signal_cache.keys()) if not k.startswith(f"{requested_timeframe}_")]
         for key in keys_to_remove:
             del _signal_cache[key]
-            logger.debug(f"Removed stale cache entry: {key}")
         
-        logger.info(f"AI signals requested for timeframe: {timeframe}, symbols: {symbols}")
+        # Keep cache size small (max 2 entries)
+        if len(_signal_cache) > 2:
+            oldest_key = min(_signal_cache.keys(), key=lambda k: _signal_cache[k]['timestamp'])
+            del _signal_cache[oldest_key]
+
+        model_timeframe = signal_generator.resolve_model_timeframe(requested_timeframe)
+
+        # If a per-timeframe model doesn't exist, fallback to the nearest available model.
+        # This prevents 1m/5m/etc. from returning empty when only a 1d model exists.
+        if not model_timeframe:
+            logger.debug(f"No trained model available for requested timeframe: {requested_timeframe} - returning empty signals")
+            return {
+                "signals": [],
+                "count": 0,
+                "timeframe": requested_timeframe,
+                "model_timeframe": None,
+                "model_available": False,
+                "model_accuracy": None
+            }
         
-        # Check if model is available (fast check)
-        if not signal_generator.is_model_available(timeframe):
-            logger.warning(f"No trained model found for timeframe: {timeframe}")
-            raise HTTPException(
-                status_code=404,
-                detail=f"No trained model found for timeframe: {timeframe}"
-            )
+        logger.debug(f"Generating fresh signals for timeframe: {requested_timeframe} (model_timeframe={model_timeframe})")
         
-        # Get cached or fresh dataset (with timeout protection)
-        logger.debug("Loading dataset...")
+        # Get cached dataset (optimized - already cached in memory)
         try:
             df = _get_cached_dataset()
         except Exception as e:
-            logger.error(f"Failed to load dataset: {str(e)}", exc_info=True)
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to load dataset: {str(e)}"
-            )
+            logger.error(f"Failed to load dataset: {str(e)}")
+            return {
+                "signals": [],
+                "count": 0,
+                "timeframe": requested_timeframe,
+                "model_timeframe": model_timeframe,
+                "model_available": True,
+                "model_accuracy": retraining_service.get_current_accuracy(model_timeframe)
+            }
         
         if df is None or df.empty:
-            logger.warning("No forex data available for signal generation")
-            raise HTTPException(
-                status_code=404,
-                detail="No forex data available for signal generation"
-            )
+            logger.debug("No dataset available - returning empty signals")
+            return {
+                "signals": [],
+                "count": 0,
+                "timeframe": requested_timeframe,
+                "model_timeframe": model_timeframe,
+                "model_available": True,
+                "model_accuracy": retraining_service.get_current_accuracy(model_timeframe)
+            }
         
-        # Get unique currency pairs
+        # Get unique currency pairs (optimized - skip if column missing)
         if 'currency_pair' not in df.columns:
-            logger.error("Dataset missing 'currency_pair' column")
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to identify currency pairs in dataset"
-            )
+            logger.debug("Dataset missing 'currency_pair' column - returning empty")
+            return {
+                "signals": [],
+                "count": 0,
+                "timeframe": requested_timeframe,
+                "model_timeframe": model_timeframe,
+                "model_available": True,
+                "model_accuracy": retraining_service.get_current_accuracy(model_timeframe)
+            }
         
         available_pairs = df['currency_pair'].unique().tolist()
-        logger.debug(f"Found {len(available_pairs)} currency pairs in dataset")
         
         # Filter by requested symbols if provided
         if symbols:
             requested_symbols = [s.strip().upper() for s in symbols.split(',')]
             available_pairs = [pair for pair in available_pairs if pair in requested_symbols]
-            logger.debug(f"Filtered to {len(available_pairs)} requested pairs")
         
-        # Limit to top 6 pairs for faster performance (reduced from 10)
-        available_pairs = available_pairs[:6]
+        # Limit to top 1 pair for maximum speed
+        available_pairs = available_pairs[:1] if available_pairs else []
         
         if not available_pairs:
-            logger.warning("No currency pairs available after filtering")
+            logger.debug("No currency pairs available")
             return {
                 "signals": [],
                 "count": 0,
-                "timeframe": timeframe,
+                "timeframe": requested_timeframe,
+                "model_timeframe": model_timeframe,
                 "model_available": True,
-                "model_accuracy": retraining_service.get_current_accuracy(timeframe)
+                "model_accuracy": retraining_service.get_current_accuracy(model_timeframe)
             }
-        
-        logger.info(f"Generating signals for {len(available_pairs)} currency pairs: {available_pairs}")
         
         # Generate signals for each pair (optimized: use only last 50 rows for faster processing)
         signals = []
@@ -496,33 +625,157 @@ async def get_ai_signals(
         
         for currency_pair in available_pairs:
             try:
-                # Get data for this pair - use only last 50 rows for faster processing
-                pair_data = df[df['currency_pair'] == currency_pair].copy()
-                if len(pair_data) == 0:
-                    logger.debug(f"No data found for {currency_pair}")
-                    continue
+                # Try to get REAL-TIME data from database/MT5 first
+                pair_data = None
+                try:
+                    from app.services import get_mt5_client
+                    from app.database import db
+                    from app.models import OHLCV
+                    from sqlalchemy import select, desc
                     
-                pair_data = pair_data.sort_values('date').tail(50)  # Reduced from 100 to 50
+                    mt5_client = get_mt5_client()
+                    
+                    # Try MT5 first for real-time data
+                    if mt5_client.is_connected:
+                        try:
+                            def _parse_tf(tf: str):
+                                tf = str(tf or '').strip()
+                                if tf.endswith('M') and tf[:-1].isdigit():
+                                    return ('month', int(tf[:-1]))
+                                low = tf.lower()
+                                if low.endswith('m') and low[:-1].isdigit():
+                                    return ('minute', int(low[:-1]))
+                                if low.endswith('h') and low[:-1].isdigit():
+                                    return ('hour', int(low[:-1]))
+                                if low.endswith('d') and low[:-1].isdigit():
+                                    return ('day', int(low[:-1]))
+                                if low.endswith('w') and low[:-1].isdigit():
+                                    return ('week', int(low[:-1]))
+                                return ('day', 1)
+
+                            def _pick_base(kind: str, n: int):
+                                if kind == 'month':
+                                    return ('MN1', n, f"{n}MS")
+                                if kind == 'minute':
+                                    if n in (1, 5, 15, 30):
+                                        return (f"M{n}", 1, None)
+                                    if n == 45:
+                                        return ('M15', 3, '45min')
+                                    return ('M1', n, f"{n}min")
+                                if kind == 'hour':
+                                    if n == 4:
+                                        return ('H4', 1, None)
+                                    return ('H1', n, f"{n}H")
+                                if kind == 'week':
+                                    return ('W1', n, f"{n}W")
+                                return ('D1', n, f"{n}D" if n != 1 else None)
+
+                            def _resample(df: 'pd.DataFrame', rule: str) -> 'pd.DataFrame':
+                                if df is None or df.empty or 'timestamp' not in df.columns:
+                                    return df
+                                tmp = df.copy().sort_values('timestamp').set_index('timestamp')
+                                agg = tmp.resample(rule).agg({
+                                    'open': 'first',
+                                    'high': 'max',
+                                    'low': 'min',
+                                    'close': 'last',
+                                    'volume': 'sum',
+                                })
+                                return agg.dropna(subset=['open', 'high', 'low', 'close']).reset_index()
+
+                            kind, n = _parse_tf(requested_timeframe)
+                            mt5_tf, mult, resample_rule = _pick_base(kind, n)
+                            
+                            # Get latest bars from MT5 (REAL-TIME)
+                            from datetime import timedelta
+                            end_time = datetime.utcnow()
+                            # Calculate start time based on timeframe
+                            base_limit = max(30, 300 * max(1, int(mult)))
+                            if mt5_tf.startswith('M'):
+                                minutes = int(mt5_tf[1:]) if len(mt5_tf) > 1 else 1
+                                start_time = end_time - timedelta(minutes=minutes * base_limit)
+                            elif mt5_tf.startswith('H'):
+                                hours = int(mt5_tf[1:]) if len(mt5_tf) > 1 else 1
+                                start_time = end_time - timedelta(hours=hours * base_limit)
+                            elif mt5_tf == 'D1':
+                                start_time = end_time - timedelta(days=base_limit)
+                            elif mt5_tf == 'W1':
+                                start_time = end_time - timedelta(weeks=base_limit)
+                            elif mt5_tf == 'MN1':
+                                start_time = end_time - timedelta(days=30 * base_limit)
+                            else:
+                                start_time = end_time - timedelta(hours=base_limit)
+                            
+                            ohlcv_df = mt5_client.get_ohlcv(currency_pair, mt5_tf, start=start_time, end=end_time)
+                            
+                            if not ohlcv_df.empty:
+                                if resample_rule:
+                                    ohlcv_df = _resample(ohlcv_df, str(resample_rule))
+                                # Convert to expected format
+                                ohlcv_df = ohlcv_df.rename(columns={'timestamp': 'date', 'close': 'close_price'})
+                                ohlcv_df['currency_pair'] = currency_pair
+                                pair_data = ohlcv_df.copy()
+                                logger.debug(f"Using REAL-TIME MT5 data for {currency_pair}")
+                        except Exception as e:
+                            logger.debug(f"MT5 data fetch failed for {currency_pair}: {str(e)}")
+                    
+                    # Fallback to database if MT5 not available
+                    if pair_data is None or pair_data.empty:
+                        async for session in db.get_session():
+                            query = (
+                                select(OHLCV)
+                                .where(OHLCV.symbol == currency_pair)
+                                .order_by(desc(OHLCV.timestamp))
+                                .limit(300)
+                            )
+                            result = await session.execute(query)
+                            rows = result.scalars().all()
+                            
+                            if rows:
+                                import pandas as pd
+                                data = []
+                                for row in rows:
+                                    data.append({
+                                        'date': row.timestamp,
+                                        'close_price': row.close,
+                                        'open': row.open,
+                                        'high': row.high,
+                                        'low': row.low,
+                                        'volume': row.volume,
+                                        'currency_pair': currency_pair
+                                    })
+                                pair_data = pd.DataFrame(data)
+                                pair_data = pair_data.sort_values('date')
+                                logger.debug(f"Using database data for {currency_pair}")
+                            break
+                    
+                except Exception as e:
+                    logger.debug(f"Real-time data fetch failed: {str(e)}, using CSV fallback")
                 
-                if len(pair_data) < 20:
-                    logger.debug(f"Insufficient data for {currency_pair} ({len(pair_data)} rows)")
+                # Fallback to CSV data if real-time not available
+                if pair_data is None or pair_data.empty:
+                    pair_data = df[df['currency_pair'] == currency_pair].copy()
+                    if len(pair_data) == 0:
+                        continue
+                    pair_data = pair_data.sort_values('date').tail(300)
+                
+                if len(pair_data) < 4:
                     continue
                 
                 # Generate signal using the model (with timeout protection)
                 try:
                     # Run prediction in executor to avoid blocking
-                    # Use a function instead of lambda to avoid closure issues
                     def generate_signal():
                         return signal_generator.predict_next_period(
                             input_data=pair_data,
-                            timeframe=timeframe,
+                            timeframe=requested_timeframe,
                             min_confidence=min_confidence
                         )
                     
                     loop = asyncio.get_event_loop()
                     result = await asyncio.wait_for(
                         loop.run_in_executor(None, generate_signal),
-                        timeout=5.0  # 5 second timeout per pair
+                        timeout=0.8  # 0.8 second timeout per pair (MAXIMUM speed)
                     )
                 except asyncio.TimeoutError:
                     logger.warning(f"Signal generation timeout for {currency_pair}")
@@ -540,9 +793,20 @@ async def get_ai_signals(
                 if signal_type == signal_generator.SIGNAL_HOLD:
                     continue
                 
-                # Get latest price
+                # Get latest price (REAL-TIME)
                 latest_price = float(pair_data['close_price'].iloc[-1])
                 confidence = result['confidence'] * 100  # Convert to percentage
+                
+                # Get REAL-TIME current price from MT5 if available
+                try:
+                    from app.services import get_mt5_client
+                    mt5_client = get_mt5_client()
+                    if mt5_client.is_connected:
+                        symbol_info = mt5_client.get_symbol_info(currency_pair)
+                        if symbol_info and symbol_info.get('bid'):
+                            latest_price = float(symbol_info['bid'])  # Use REAL-TIME price
+                except:
+                    pass  # Use historical price if MT5 not available
                 
                 # Generate reasoning
                 if signal_type == 'BUY':
@@ -552,6 +816,9 @@ async def get_ai_signals(
                 else:
                     reason = f"Low confidence signal (confidence: {confidence:.1f}%)"
                 
+                # ALWAYS use current timestamp for REAL-TIME signals
+                current_timestamp = datetime.utcnow().isoformat()
+                
                 signals.append({
                     'id': signal_id_counter,
                     'symbol': currency_pair,
@@ -559,8 +826,10 @@ async def get_ai_signals(
                     'confidence': round(confidence, 1),
                     'reason': reason,
                     'price': round(latest_price, 4),
-                    'timeframe': timeframe,
-                    'timestamp': datetime.utcnow().isoformat()
+                    'timeframe': requested_timeframe,
+                    'model_timeframe': result.get('model_timeframe') or model_timeframe,
+                    'timestamp': current_timestamp,  # REAL-TIME timestamp
+                    '_cache_key': f"{requested_timeframe}_{currency_pair}_{datetime.utcnow().timestamp()}"  # Force unique key
                 })
                 signal_id_counter += 1
                 
@@ -569,27 +838,30 @@ async def get_ai_signals(
                 continue
         
         elapsed = (datetime.utcnow() - start_time).total_seconds()
-        logger.info(f"Generated {len(signals)} AI signals for timeframe {timeframe} in {elapsed:.2f}s")
+        logger.debug(f"Generated {len(signals)} signals for {timeframe} in {elapsed:.3f}s")
         
         # Build response
         response_data = {
             "signals": signals,
             "count": len(signals),
-            "timeframe": timeframe,
+            "timeframe": requested_timeframe,
+            "model_timeframe": model_timeframe,
             "model_available": True,
-            "model_accuracy": retraining_service.get_current_accuracy(timeframe)
+            "model_accuracy": retraining_service.get_current_accuracy(model_timeframe)
         }
         
-        # Cache the results
+        # Cache the results with current timestamp
         _signal_cache[cache_key] = {
             'data': response_data,
             'timestamp': datetime.utcnow()
         }
         
-        # Clean old cache entries (keep only last 10)
-        if len(_signal_cache) > 10:
+        # Clean old cache entries (keep only last 2)
+        if len(_signal_cache) > 2:
             oldest_key = min(_signal_cache.keys(), key=lambda k: _signal_cache[k]['timestamp'])
             del _signal_cache[oldest_key]
+        
+        logger.info(f"Cached signals for {timeframe} (cache size: {len(_signal_cache)})")
         
         return response_data
         

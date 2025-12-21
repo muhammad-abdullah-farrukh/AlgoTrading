@@ -123,6 +123,19 @@ class MT5ConnectionStatus(Base):
         return f"<MT5ConnectionStatus(connected={self.connected}, mode={self.mode})>"
 
 
+class TradingSettings(Base):
+    """Trading settings persistence (e.g., live vs demo mode)."""
+    __tablename__ = "trading_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    live_mode = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    def __repr__(self):
+        return f"<TradingSettings(live_mode={self.live_mode})>"
+
+
 class AutotradingSettings(Base):
     """Autotrading settings and controls."""
     __tablename__ = "autotrading_settings"
@@ -134,6 +147,7 @@ class AutotradingSettings(Base):
     take_profit_percent = Column(Float, nullable=True)  # Take profit as percentage (e.g., 5.0 for 5%)
     max_daily_loss = Column(Float, nullable=True)  # Maximum daily loss amount
     position_size = Column(Float, nullable=True)  # Default position size
+    timeframe = Column(String(20), nullable=True)  # Preferred timeframe for AI signals (e.g., 1d, 1h, 15m)
     auto_mode = Column(Boolean, default=False, nullable=False)  # Auto vs manual mode
     selected_strategy_id = Column(Integer, ForeignKey('strategies.id'), nullable=True)  # Selected strategy
     daily_loss_reset_date = Column(DateTime, nullable=True)  # Date when daily loss was last reset

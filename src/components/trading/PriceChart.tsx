@@ -13,11 +13,11 @@ import {
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { OHLCVData, calculateRSI, calculateEMA, calculateMACD } from '@/utils/dummyData';
+import { calculateEMA, calculateMACD, calculateRSI, type OhlcvPoint } from '@/utils/indicators';
 import { TrendingUp, TrendingDown } from 'lucide-react';
 
 interface PriceChartProps {
-  data: OHLCVData[];
+  data: OhlcvPoint[];
   symbol?: string;
   currentPrice?: number;
 }
@@ -26,6 +26,13 @@ type Indicator = 'rsi' | 'ema9' | 'ema21' | 'macd' | 'volume';
 
 export const PriceChart = ({ data, symbol = 'EURUSD', currentPrice }: PriceChartProps) => {
   const [activeIndicators, setActiveIndicators] = useState<Set<Indicator>>(new Set(['volume']));
+
+  const lastClose = data.length ? data[data.length - 1].close : undefined;
+  const displayPriceLabel = currentPrice !== undefined
+    ? currentPrice.toFixed(5)
+    : lastClose !== undefined
+      ? lastClose.toFixed(5)
+      : '--';
 
   const toggleIndicator = (indicator: Indicator) => {
     setActiveIndicators(prev => {
@@ -40,10 +47,10 @@ export const PriceChart = ({ data, symbol = 'EURUSD', currentPrice }: PriceChart
   };
 
   const chartData = useMemo(() => {
-    const rsi = calculateRSI(data);
+    const rsi = calculateRSI(data, 14);
     const ema9 = calculateEMA(data, 9);
     const ema21 = calculateEMA(data, 21);
-    const macdData = calculateMACD(data);
+    const macdData = calculateMACD(data, 12, 26, 9);
 
     return data.map((d, i) => ({
       time: new Date(d.time).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
@@ -51,10 +58,10 @@ export const PriceChart = ({ data, symbol = 'EURUSD', currentPrice }: PriceChart
       high: d.high,
       low: d.low,
       volume: d.volume,
-      rsi: rsi[i - 14] || null,
-      ema9: ema9[i - 9] || null,
-      ema21: ema21[i - 21] || null,
-      macd: macdData.histogram[i - 35] || null,
+      rsi: rsi[i] ?? null,
+      ema9: ema9[i] ?? null,
+      ema21: ema21[i] ?? null,
+      macd: macdData.histogram[i] ?? null,
       isUp: d.close >= d.open
     }));
   }, [data]);
@@ -79,7 +86,7 @@ export const PriceChart = ({ data, symbol = 'EURUSD', currentPrice }: PriceChart
             <CardTitle className="text-xl font-semibold">{symbol}</CardTitle>
             <div className="flex items-center gap-2">
               <span className="text-2xl font-mono font-bold text-foreground">
-                {currentPrice?.toFixed(5) || data[data.length - 1]?.close.toFixed(5)}
+                {displayPriceLabel}
               </span>
               <Badge 
                 variant={priceChange >= 0 ? "default" : "destructive"}
@@ -108,6 +115,11 @@ export const PriceChart = ({ data, symbol = 'EURUSD', currentPrice }: PriceChart
       </CardHeader>
       
       <CardContent>
+        {data.length === 0 ? (
+          <div className="h-[400px] flex items-center justify-center text-sm text-muted-foreground">
+            No chart data available.
+          </div>
+        ) : (
         <div className="h-[400px]">
           <ResponsiveContainer width="100%" height="100%">
             <ComposedChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
@@ -201,6 +213,7 @@ export const PriceChart = ({ data, symbol = 'EURUSD', currentPrice }: PriceChart
             </ComposedChart>
           </ResponsiveContainer>
         </div>
+        )}
         
         {/* RSI Sub-chart */}
         {activeIndicators.has('rsi') && (
